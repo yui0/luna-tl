@@ -1,0 +1,3 @@
+cmake -B build -S . -DDYNARMIC_WARNINGS_AS_ERRORS=OFF
+cmake --build build -j$(nproc)
+
