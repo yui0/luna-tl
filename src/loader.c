@@ -17,12 +17,21 @@
 #include <elf.h>
 #include <err.h>
 #include <limits.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include "linker/dlfcn.h"
 #include "linker/linker.h"
 #include "jvm/jvm.h"
 #include "arm_exec.h"
 #include <link.h>
+
+/* Exposed from arm_exec.cpp for diagnostic dumps */
+extern void arm_exec_svc_ring_dump(void);
+
+static void svc_dump_handler(int sig) {
+    (void)sig;
+    arm_exec_svc_ring_dump();
+}
 
 /* libmono.so @ 0x20000000: mono_defaults struct and key fields */
 static uint32_t mono_export_call(const char *sym)
@@ -313,13 +322,23 @@ run_jni_game_arm(struct jvm *jvm)
     * (libunity+0x39c7d0)。texW/texH は AAPCS でスタック渡しのため
     * arm_exec_call (レジスタ 4 本のみ) だと 0 を読み scale=inf になり、
     * 以後の全タッチ座標が inf に化ける (GUI.Button が反応しない真因)。 */
+   fprintf(stderr, "[loader] calling nativeResize...\n");
    if (va_resize)
       arm_exec_call6(va_resize, env, ctx, 1280, 720, 1280, 720);
+   fprintf(stderr, "[loader] calling nativeFocusChanged...\n");
    if (va_focus)
       arm_exec_call(va_focus, env, ctx, 1, 0);
+   fprintf(stderr, "[loader] calling nativeResume...\n");
    if (va_resume)
       arm_exec_call(va_resume, env, ctx, 0, 0);
+   fprintf(stderr, "[loader] nativeResume done, running pending threads...\n");
    arm_exec_run_pending_threads();
+   fprintf(stderr, "[loader] entering render loop\n");
+   /* SIGUSR1: dump SVC ring buffer on demand (kill -USR1 <pid>) */
+   signal(SIGUSR1, svc_dump_handler);
+   /* SIGALRM: auto-dump after 15s to diagnose first-frame hang */
+   signal(SIGALRM, svc_dump_handler);
+   alarm(15);
 
    /* 注意: nativeDone() はここでは呼ばない。Unity 5+ では nativeDone() は
     * UnityPlayer.destroy() からの終了処理であり、レンダーループ前に呼ぶと
@@ -436,7 +455,7 @@ run_jni_game_arm(struct jvm *jvm)
       /* Unity はeglSwapBuffersをJava側に任せる場合があるのでここで呼ぶ */
       arm_exec_egl_swap();
       ++frame_count;
-      if (ok != last_ok) {
+      if (ok != last_ok || (frame_count <= 5) || (frame_count % 100 == 0)) {
          fprintf(stderr, "[loader] nativeRender → %d (frame %d)\n", ok, frame_count);
          last_ok = ok;
       }

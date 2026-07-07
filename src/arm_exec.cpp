@@ -2275,6 +2275,11 @@ static std::map<int, uint32_t> g_sighandlers;
 /* pthread_cond guest VA → waiter count (signal tracking only) */
 static std::map<uint32_t, uint32_t> g_conds; /* VA → signal_pending */
 
+/* futex wake tokens: futex_wake records pending wakes so next futex_wait on same addr returns 0 */
+static std::map<uint32_t, uint32_t> g_futex_wake_tokens; /* uaddr → pending wake count */
+/* futex waiters: tracks which addrs non-main threads are currently blocking on */
+static std::map<uint32_t, uint32_t> g_futex_wait_addrs; /* uaddr → count of waiting threads */
+
 /* pthread_rwlock: no real blocking under cooperative scheduling; track state for EBUSY */
 static std::map<uint32_t, int32_t>  g_rwlocks;
 static std::map<uint32_t, uint32_t> g_rwlock_writer; /* VA → writer tid */
@@ -2286,8 +2291,13 @@ static std::unordered_set<uint32_t> g_detached_threads;
 struct SvcTraceEnt { uint32_t svc, lr, r0, tid; };
 static SvcTraceEnt g_svc_ring[1024];
 static uint32_t    g_svc_ring_pos = 0;
+/* Dedicated main-thread (tid=0) ring so worker SVC calls don't overwrite it */
+static SvcTraceEnt g_svc_ring_main[256];
+static uint32_t    g_svc_ring_main_pos = 0;
 static void svc_ring_record(uint32_t svc, uint32_t lr, uint32_t r0) {
     g_svc_ring[g_svc_ring_pos++ & 1023] = {svc, lr, r0, g_current_tid};
+    if (g_current_tid == 0)
+        g_svc_ring_main[g_svc_ring_main_pos++ & 255] = {svc, lr, r0, 0};
 }
 static void svc_ring_dump(void) {
     fprintf(stderr, "[arm_exec] last SVCs (oldest first):\n");
@@ -2296,6 +2306,13 @@ static void svc_ring_dump(void) {
         if (e.svc || e.lr)
             fprintf(stderr, "  svc=%u lr=0x%08x r0=0x%08x tid=%u\n",
                     e.svc, e.lr, e.r0, e.tid);
+    }
+    fprintf(stderr, "[arm_exec] last main-thread SVCs (oldest first):\n");
+    for (uint32_t i = 0; i < 256; ++i) {
+        const SvcTraceEnt &e = g_svc_ring_main[(g_svc_ring_main_pos + i) & 255];
+        if (e.svc || e.lr)
+            fprintf(stderr, "  main svc=%u lr=0x%08x r0=0x%08x\n",
+                    e.svc, e.lr, e.r0);
     }
 }
 /* Per-thread errno: shared errno breaks sem_wait EINTR retry across threads */
@@ -2311,6 +2328,8 @@ static uint32_t errno_va(ArmExecCtx &ctx, uint32_t tid) {
 }
 /* true when guest thread is blocked — CallSVC yields the slice */
 static bool g_yield_requested = false;
+/* ALooper_wake() sets this; ALooper_pollOnce spin loop checks it */
+static std::atomic<bool> g_alooper_wake_pending{false};
 static bool g_in_cb = false;  /* true while call_guest_cb is executing */
 
 /* __errno location in guest memory (allocated lazily from the heap) */
@@ -4593,16 +4612,50 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
  * Mirror the SVC_SYSCALL futex path (which handles syscall() PLT calls)
  * but with ARM raw-svc argument registers instead of r0=nr,r1=uaddr. */
             uint32_t cmd = r1 & 0x7fu; /* strip FUTEX_PRIVATE_FLAG */
-            if (cmd != 0u && cmd != 9u) { ret32(0); break; } /* FUTEX_WAKE etc.: no-op */
+            if (cmd != 0u && cmd != 9u) { /* FUTEX_WAKE / FUTEX_REQUEUE etc. */
+                uint32_t nwake = (r2 == 0u) ? 1u : std::min(r2, 256u);
+                g_futex_wake_tokens[r0] += nwake;
+                auto wa = g_futex_wait_addrs.find(r0);
+                if (wa != g_futex_wait_addrs.end()) {
+                    uint32_t woke = std::min(nwake, wa->second);
+                    wa->second -= woke;
+                    if (wa->second == 0u) g_futex_wait_addrs.erase(wa);
+                }
+                if (getenv("LUNARIA_TRACE_FUTEX")) {
+                    static uint64_t wkr = 0;
+                    if (wkr < 256)
+                        fprintf(stderr, "[futex/raw] WAKE cmd=%u uaddr=0x%x word=0x%x nwake=%u tid=%u tokens=%u\n",
+                                cmd, r0, ctx.mem.read32(r0), nwake, g_current_tid,
+                                g_futex_wake_tokens[r0]);
+                    ++wkr;
+                }
+                ret32(0); break;
+            }
             if (ctx.mem.read32(r0) != r2) { ret32(0); break; } /* value already changed */
+            /* Check pending wake tokens */
+            {
+                auto tok = g_futex_wake_tokens.find(r0);
+                if (tok != g_futex_wake_tokens.end() && tok->second > 0u) {
+                    --tok->second;
+                    if (tok->second == 0u) g_futex_wake_tokens.erase(tok);
+                    ret32(0); break;
+                }
+            }
             bool changed = false;
             if (g_current_tid == 0 && !g_scheduling && !g_threads.empty()) {
                 int spin_limit = (int)env_ticks("LUNARIA_FUTEX_SPINS", 500);
                 for (int spin = 0; spin < spin_limit && !changed; ++spin) {
                     schedule_threads(20'000'000ULL);
                     if (ctx.mem.read32(r0) != r2) changed = true;
+                    auto tok = g_futex_wake_tokens.find(r0);
+                    if (!changed && tok != g_futex_wake_tokens.end() && tok->second > 0u) {
+                        --tok->second;
+                        if (tok->second == 0u) g_futex_wake_tokens.erase(tok);
+                        changed = true;
+                    }
                 }
-            } else if (g_current_tid != 0) {
+            } else {
+                g_futex_wait_addrs[r0]++;
                 g_yield_requested = true; /* yield slice; scheduler re-checks */
             }
             if (changed) { ret32(0); break; }
@@ -5605,10 +5658,43 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_ALOOPER_FORTHREAD: case SVC_ALOOPER_PREPARE:
         /* Return a non-NULL sentinel so Unity doesn't skip frame processing */
         ret32(ARM_ALOOPER); break;
-    case SVC_ALOOPER_POLLONCE: case SVC_ALOOPER_POLLALL:
-        /* ALOOPER_POLL_TIMEOUT (-3): no events, caller continues normally */
-        ret32((uint32_t)-3); break;
+    case SVC_ALOOPER_POLLONCE: case SVC_ALOOPER_POLLALL: {
+        /* ALooper_pollOnce(timeoutMillis, outFd, outEvents, outData)
+         * r0 = timeoutMillis: 0=poll immediately, -1=block forever, >0=timed wait
+         * Returns: >= 0 = fd with event, POLL_CALLBACK(-1), POLL_TIMEOUT(-3), POLL_WAKE(-2)
+         *
+         * With timeout==0 return POLL_TIMEOUT immediately (poll mode — caller continues).
+         * With timeout!=0 the caller expects to block; if we return immediately the
+         * caller loops back and calls us again, creating an infinite spin that
+         * prevents worker threads from ever running.  Yield to workers so they can
+         * make progress (e.g. deliver a wake via SVC_ALOOPER_WAKE). */
+        int32_t timeout_ms = (int32_t)r0;
+        static uint32_t alooper_poll_count = 0;
+        if (alooper_poll_count++ < 4)
+            fprintf(stderr, "[alooper] pollOnce/All timeout=%d tid=%u #%u\n",
+                    timeout_ms, g_current_tid, alooper_poll_count - 1);
+        if (timeout_ms == 0) {
+            /* Immediate poll: return POLL_TIMEOUT, caller continues normally */
+            ret32((uint32_t)-3);
+        } else if (g_current_tid == 0 && !g_scheduling && !g_threads.empty()) {
+            /* Main thread blocking wait: spin schedule_threads so workers can run,
+             * check for wake signal.  Same pattern as futex_wait on main thread. */
+            int spin_limit = (int)env_ticks("LUNARIA_FUTEX_SPINS", 500);
+            bool woken = false;
+            for (int s = 0; s < spin_limit && !woken; ++s) {
+                schedule_threads(20'000'000ULL);
+                if (g_alooper_wake_pending.exchange(false)) woken = true;
+            }
+            ret32(woken ? (uint32_t)-2u : (uint32_t)-3u); /* POLL_WAKE or POLL_TIMEOUT */
+        } else {
+            /* Worker thread or no workers: yield this thread's slice */
+            if (g_current_tid != 0) g_yield_requested = true;
+            ret32((uint32_t)-3);
+        }
+        break;
+    }
     case SVC_ALOOPER_WAKE:
+        g_alooper_wake_pending.store(true);
         ret32(0u); break;
 
     /* ---- EGL ---- */
@@ -7072,19 +7158,38 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         switch (r0) {
         case 240: { /* __NR_futex(uaddr=r1, op=r2, val=r3, timeout=[sp]) */
             uint32_t cmd = r2 & 0x7fu; /* strip FUTEX_PRIVATE_FLAG / CLOCK_REALTIME */
-            if (cmd != 0u && cmd != 9u) { /* not FUTEX_WAIT[_BITSET]: no-op wake */
+            if (cmd != 0u && cmd != 9u) { /* FUTEX_WAKE / FUTEX_REQUEUE etc. */
+                /* Record pending wake tokens so next futex_wait on this addr returns 0 */
+                uint32_t nwake = (r2 == 0u) ? 1u : std::min(r2, 256u);
+                g_futex_wake_tokens[r1] += nwake;
+                /* Remove address from waiters map (threads are being woken) */
+                auto wa = g_futex_wait_addrs.find(r1);
+                if (wa != g_futex_wait_addrs.end()) {
+                    uint32_t woke = std::min(nwake, wa->second);
+                    wa->second -= woke;
+                    if (wa->second == 0u) g_futex_wait_addrs.erase(wa);
+                }
                 if (getenv("LUNARIA_TRACE_FUTEX")) {
                     static uint64_t wk = 0;
-                    if (wk < 128)
-                        fprintf(stderr, "[futex] WAKE cmd=%u uaddr=0x%x word=0x%x tid=%u (#%llu)\n",
-                                cmd, r1, ctx.mem.read32(r1), g_current_tid,
-                                (unsigned long long)wk);
+                    if (wk < 256)
+                        fprintf(stderr, "[futex] WAKE cmd=%u uaddr=0x%x word=0x%x nwake=%u tid=%u tokens=%u (#%llu)\n",
+                                cmd, r1, ctx.mem.read32(r1), nwake, g_current_tid,
+                                g_futex_wake_tokens[r1], (unsigned long long)wk);
                     ++wk;
                 }
                 ret32(0);
                 break;
             }
             if (ctx.mem.read32(r1) != r3) { ret32(0); break; } /* word already changed */
+            /* Check pending wake tokens before blocking */
+            {
+                auto tok = g_futex_wake_tokens.find(r1);
+                if (tok != g_futex_wake_tokens.end() && tok->second > 0u) {
+                    --tok->second;
+                    if (tok->second == 0u) g_futex_wake_tokens.erase(tok);
+                    ret32(0); break;
+                }
+            }
             bool changed = false;
             if (g_current_tid == 0 && !g_scheduling && !g_threads.empty()) {
                 /* Give worker threads up to LUNARIA_FUTEX_SPINS×20M ticks to change
@@ -7095,7 +7200,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 for (int spin = 0; spin < spin_limit && !changed; ++spin) {
                     schedule_threads(20'000'000ULL);
                     if (ctx.mem.read32(r1) != r3) changed = true;
+                    /* re-check wake tokens after scheduling */
+                    auto tok = g_futex_wake_tokens.find(r1);
+                    if (!changed && tok != g_futex_wake_tokens.end() && tok->second > 0u) {
+                        --tok->second;
+                        if (tok->second == 0u) g_futex_wake_tokens.erase(tok);
+                        changed = true;
+                    }
                 }
+            } else {
+                /* non-main or nested: register as waiter then yield */
+                g_futex_wait_addrs[r1]++;
             }
             if (changed) {
                 static uint64_t woken = 0;
@@ -7108,7 +7223,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
             {
                 static uint64_t timed = 0;
-                if (getenv("LUNARIA_TRACE_FUTEX") && timed < 64)
+                if (getenv("LUNARIA_TRACE_FUTEX") && timed < 256)
                     fprintf(stderr, "[futex] WAIT timeout uaddr=0x%x val=%u tid=%u (#%llu)\n",
                             r1, r3, g_current_tid, (unsigned long long)timed);
                 ++timed;
@@ -7872,12 +7987,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_PTHREAD_COND_INIT:
         if (r0) { g_conds[r0] = 0; ctx.mem.write32(r0, 0u); }
         ret32(0); break;
-    case SVC_PTHREAD_COND_SIGNAL:
+    case SVC_PTHREAD_COND_SIGNAL: {
+        static uint32_t cs_count = 0;
+        /* always log 0x46ffed34 to track whether it ever gets signaled */
+        if (cs_count++ < 40 || r0 == 0x46ffed34u)
+            fprintf(stderr, "[cond] signal cond=0x%08x tid=%u lr=0x%08x\n",
+                    r0, g_current_tid, regs[14]);
         if (r0) { auto &c = g_conds[r0]; if (c < 1) c = 1; }
         ret32(0); break;
-    case SVC_PTHREAD_COND_BROADCAST:
-        if (r0) g_conds[r0] = UINT32_MAX; 
+    }
+    case SVC_PTHREAD_COND_BROADCAST: {
+        static uint32_t cb_count = 0;
+        /* always log 0x46ffed34 to track whether it ever gets broadcast */
+        if (cb_count++ < 40 || r0 == 0x46ffed34u)
+            fprintf(stderr, "[cond] broadcast cond=0x%08x tid=%u lr=0x%08x\n",
+                    r0, g_current_tid, regs[14]);
+        if (r0) g_conds[r0] = UINT32_MAX;
         ret32(0); break;
+    }
     case SVC_PTHREAD_COND_DESTROY:
         if (r0) g_conds.erase(r0);
         ret32(0); break;
@@ -7933,27 +8060,102 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
 
     /* ---- pthread_cond_wait / timedwait ----------------------------------- */
     case SVC_PTHREAD_COND_WAIT: {
-        
+
         uint32_t cond  = r0;
         uint32_t mutex = r1;
+        static uint32_t cw_count = 0;
+        /* always log non-main-thread waits and target condvars for diagnosis */
+        if (cw_count++ < 20 || g_current_tid != 0 ||
+                cond == 0x46ffed34u || cond == 0x02ec7184u)
+            fprintf(stderr, "[cond] wait cond=0x%08x mutex=0x%08x tid=%u lr=0x%08x g_conds[cond]=%d\n",
+                    cond, mutex, g_current_tid, regs[14],
+                    (cond && g_conds.count(cond)) ? (int)g_conds[cond] : -1);
         if (cond) {
             auto it = g_conds.find(cond);
             if (it != g_conds.end() && it->second > 0) {
-                
+
                 if (it->second != UINT32_MAX) --it->second;
                 ret32(0); break;
             }
         }
-        
+
         uint32_t saved_w = mutex ? ctx.mem.read32(mutex) : 0u;
         if (mutex) ctx.mem.write32(mutex, 0u);
-        if (!g_threads.empty()) schedule_threads(env_ticks("LUNARIA_THREAD_TICKS", 200'000'000ULL));
-        
+        /* Main thread: spin schedule_threads (like futex_wait) until cond is signaled.
+         * A single pass is not enough when workers need multiple iterations to complete
+         * their initialization task and call cond_signal. */
+        {
+            static uint32_t cwpre = 0;
+            if (cwpre++ < 10)
+                fprintf(stderr, "[cond_wait_pre] cond=0x%08x tid=%u sched=%d threads=%zu cond_val=%d\n",
+                        cond, g_current_tid, (int)g_scheduling, g_threads.size(),
+                        (cond && g_conds.count(cond)) ? (int)g_conds[cond] : -1);
+        }
+        if (g_current_tid == 0 && !g_scheduling && !g_threads.empty()) {
+            /* Spin schedule_threads until cond is signaled by a worker.
+             * Use LUNARIA_THREAD_TICKS (default 200M) per pass so workers get
+             * enough time to complete their startup/task and call cond_signal. */
+            int spin_limit = (int)env_ticks("LUNARIA_FUTEX_SPINS", 500);
+            for (int spin = 0; spin < spin_limit; ++spin) {
+                /* Unity workers use futex_wait(arg+0x48) rather than pthread_cond_wait,
+                 * so cond_broadcast doesn't reach them via our g_conds mechanism.
+                 * Inject wake tokens AND set the futex word to 1 so the worker's
+                 * sem_wait CAS loop (which checks val>0) succeeds and fetches its job. */
+                if (!g_futex_wait_addrs.empty()) {
+                    for (auto& kv : g_futex_wait_addrs) {
+                        if (ctx.mem.read32(kv.first) == 0u)
+                            ctx.mem.write32(kv.first, 1u); /* sem_count++ so CAS succeeds */
+                        g_futex_wake_tokens[kv.first] += kv.second;
+                    }
+                    g_futex_wait_addrs.clear();
+                }
+                schedule_threads(env_ticks("LUNARIA_THREAD_TICKS", 200'000'000ULL));
+                if (cond && g_conds.count(cond) && g_conds[cond] > 0) break;
+                /* Diagnose why workers aren't signaling: dump futex waiter/token state */
+                if (spin < 3 || (spin % 50 == 0)) {
+                    fprintf(stderr, "[cond_spin] spin=%d cond=0x%08x cond_val=%d "
+                            "futex_waiters=%zu futex_tokens=%zu\n",
+                            spin, cond,
+                            (cond && g_conds.count(cond)) ? (int)g_conds[cond] : -1,
+                            g_futex_wait_addrs.size(),
+                            g_futex_wake_tokens.size());
+                    if (spin < 2) {
+                        for (auto& kv : g_futex_wait_addrs)
+                            fprintf(stderr, "  [futex_waiter] uaddr=0x%08x count=%u word=0x%08x\n",
+                                    kv.first, kv.second, ctx.mem.read32(kv.first));
+                        for (auto& kv : g_futex_wake_tokens)
+                            fprintf(stderr, "  [futex_token]  uaddr=0x%08x tokens=%u\n",
+                                    kv.first, kv.second);
+                        /* dump last worker SVCs so we can see what they called after waking */
+                        fprintf(stderr, "  [svc_ring] last worker SVCs (newest first):\n");
+                        uint32_t wdump = 0;
+                        for (uint32_t bi = 0; bi < 1024u && wdump < 30u; ++bi) {
+                            const SvcTraceEnt &e = g_svc_ring[(g_svc_ring_pos - 1u - bi) & 1023u];
+                            if (e.tid != 0u && (e.svc || e.lr)) {
+                                fprintf(stderr, "    svc=%-5u lr=0x%08x r0=0x%08x tid=%u\n",
+                                        e.svc, e.lr, e.r0, e.tid);
+                                ++wdump;
+                            }
+                        }
+                        /* dump g_conds */
+                        fprintf(stderr, "  [g_conds] %zu entries:\n", g_conds.size());
+                        uint32_t cdump = 0;
+                        for (auto& kv2 : g_conds) {
+                            if (cdump++ < 16u)
+                                fprintf(stderr, "    cond=0x%08x val=%u\n", kv2.first, kv2.second);
+                        }
+                    }
+                }
+            }
+        } else if (!g_threads.empty()) {
+            schedule_threads(env_ticks("LUNARIA_THREAD_TICKS", 200'000'000ULL));
+        }
+
         if (mutex) {
             uint32_t w = saved_w < 0x100u ? 0x100u : (saved_w & ~0xffu);
             ctx.mem.write32(mutex, w | (g_current_tid + 1u));
         }
-        
+
         if (g_current_tid != 0) g_yield_requested = true;
         ret32(0); break;
     }
@@ -11678,4 +11880,15 @@ extern "C" void arm_exec_egl_swap(void) {
         }
     }
     g_arm_did_swap = false;
+}
+
+extern "C" void arm_exec_svc_ring_dump(void) {
+    svc_ring_dump();
+    /* Also dump main JIT PC and recent block PCs if available */
+    if (g_ctx && g_ctx->jit) {
+        auto &jit = *g_ctx->jit;
+        fprintf(stderr, "[arm_exec] main-jit PC=0x%08x LR=0x%08x R0=0x%08x tid=%u\n",
+                (uint32_t)jit.Regs()[15], (uint32_t)jit.Regs()[14],
+                (uint32_t)jit.Regs()[0], g_current_tid);
+    }
 }

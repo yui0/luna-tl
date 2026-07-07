@@ -1,4 +1,4 @@
-**Lunaria — Android-to-Linux Loader** 🎮🐧
+**Lunaria — Translation layer for iOS/Android** 🎮🐧
 
 **Run Android ARM/x86_64 JNI libraries (especially Unity's `libunity.so`) on Linux** using **dynarmic JIT** emulation! 🚀
 
@@ -12,8 +12,6 @@
 - **OpenGL/ES + EGL** passthrough to host
 - **Headless support** via Xvfb
 - **Memory-efficient** flat 4GB guest address space
-
----
 
 ### 🛠️ Build Instructions
 
@@ -32,8 +30,6 @@ make fetch-btw
 sudo apt install libglfw3-dev libegl1-mesa-dev libgles2-mesa-dev \
                  libbsd-dev libunwind-dev libboost-dev zlib1g-dev
 ```
-
----
 
 ### 🚀 How to Run
 
@@ -54,8 +50,6 @@ bash lunaria-apk.sh test/btw-android.apk
 Xvfb :99 & DISPLAY=:99 ./lunaria ...
 ```
 
----
-
 ### ⚙️ Environment Variables
 
 | Variable                    | Default     | Description |
@@ -72,8 +66,6 @@ Xvfb :99 & DISPLAY=:99 ./lunaria ...
 
 **Tip:** You can use `K`/`M`/`G` suffixes: `LUNARIA_ONLOAD_TICKS=5G`
 
----
-
 ### 🏗️ Architecture Overview
 
 - **Flat 4GB Memory** — Entire guest 32-bit address space is one big `mmap` (with fastmem)
@@ -83,8 +75,6 @@ Xvfb :99 & DISPLAY=:99 ./lunaria ...
 - **Asset Bridge** — `getAssets().open()` reads directly from APK (DEFLATE + STORE)
 - **Safety Guards** — Prevents wild jumps, infinite JIT growth, and memory corruption
 
----
-
 ### 📁 Project Structure (Key Files)
 
 - `arm_exec.cpp` — Core ARM emulation engine
@@ -93,8 +83,6 @@ Xvfb :99 & DISPLAY=:99 ./lunaria ...
 - `test/` — Sample APKs and libraries
 - `jvm/` — JNI/JVM bridge
 
----
-
 ### 🎯 Supported Games / Use Cases
 
 - Unity 4.x / 5.x games (Mono + IL2CPP)
@@ -102,15 +90,15 @@ Xvfb :99 & DISPLAY=:99 ./lunaria ...
 - Headless server execution
 - Game modding & reverse engineering
 
----
+### 🎯 Screenshots
+
+![Screenshot 01](screenshot_01.jpg)
 
 ### 🔧 Troubleshooting
 
 - **Black screen?** Try `LUNARIA_TRACE_EXC=1` or `LUNARIA_TRACE_MONO=1`
 - **Slow?** Increase tick limits or check GPU passthrough
 - **Crashes?** Enable `LUNARIA_DUMP_LAST_SVC=1` and report the log
-
----
 
 **Made with ❤️ for the retro Android gaming & emulation community**
 
