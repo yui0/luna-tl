@@ -706,6 +706,18 @@ android_view_InputEvent_getDeviceId(JNIEnv *env, jobject object, va_list args)
    return 0;
 }
 
+/* Unity 2023 resolves the InputEvent getters against the MotionEvent class
+ * (GetMethodID on the event's own class), which forms these symbol names —
+ * without them getSource() fell back to 0 and the touchscreen filter in
+ * nativeInjectEvent rejected every injected tap. */
+jint
+android_view_MotionEvent_getSource(JNIEnv *env, jobject object, va_list args)
+{
+   assert(env && object);
+   motion_trace("getSource");
+   return 0x00001002; // SOURCE_TOUCHSCREEN
+}
+
 /* MotionEvent getters read the current touch event captured from the GLFW
  * mouse by arm_exec.cpp (see arm_exec_touch_* in arm_exec.h).  The loader
  * pops one event per arm_exec_touch_next() and injects it via

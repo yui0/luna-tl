@@ -848,8 +848,14 @@ static constexpr uint32_t SVC_GL3_DeleteSync             = SVC31_BASE + 49u;
 static constexpr uint32_t SVC_GL3_InvalidateFramebuffer  = SVC31_BASE + 50u;
 static constexpr uint32_t SVC_GL3_DetachShader           = SVC31_BASE + 51u;
 static constexpr uint32_t SVC_GL3_DrawBuffers            = SVC31_BASE + 52u;
+static constexpr uint32_t SVC_GL3_DrawElementsBaseVertex = SVC31_BASE + 53u;
 
-static constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_GL3_DrawBuffers + 1u;
+/* __cxa_throw logging (always on): identifies which managed exception IL2CPP
+ * throws — the GOT of every importer is redirected to a tail-call stub that
+ * emits this SVC before entering the real libc++abi __cxa_throw. */
+static constexpr uint32_t SVC_EXC_CXA_THROW              = SVC31_BASE + 54u;
+
+static constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_EXC_CXA_THROW + 1u;
 
 static constexpr uint32_t TRAMP_STRIDE     = 8u; /* ARM32: SVC #n + BX LR */
 
@@ -1146,6 +1152,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glInvalidateFramebuffer",  SVC_GL3_InvalidateFramebuffer},
     {"glDetachShader",           SVC_GL3_DetachShader},
     {"glDrawBuffers",            SVC_GL3_DrawBuffers},
+    {"glDrawElementsBaseVertex", SVC_GL3_DrawElementsBaseVertex},
 
     {"clock_gettime",           SVC_CLOCK_GETTIME},
     {"gettimeofday",            SVC_GETTIMEOFDAY},
@@ -1908,6 +1915,9 @@ static uint32_t           g_g_build_filename_tramp = 0;
 static constexpr uint32_t EXC_STUB_BASE = 0x4100a000u;
 static uint32_t           g_exc_stub_from_name = 0;
 static uint32_t           g_exc_stub_raise     = 0;
+/* one stub per distinct __cxa_throw implementation (libc++_shared's and
+ * libil2cpp's statically linked copy have separate unwinder state) */
+static std::map<uint32_t, uint32_t> g_exc_stub_cxa_throw; /* real_va → stub_va */
 
 /* inline-detour state (defined early so dispatch_svc can read it). */
 static constexpr uint32_t DETOUR_STUB_BASE = 0x4100c000u;
@@ -2435,6 +2445,15 @@ static std::map<uint32_t, uint32_t> g_conds; /* VA → signal_pending */
 
 /* futex wake tokens: futex_wake records pending wakes so next futex_wait on same addr returns 0 */
 static std::map<uint32_t, uint32_t> g_futex_wake_tokens; /* uaddr → pending wake count */
+/* LUNARIA_TRACE_FUTEX_ADDR=hexaddr: full WAIT/WAKE/park/unpark trace for one
+ * futex word (uaddr-filtered so it stays readable on busy runs). */
+static bool ftrace_addr(uint32_t uaddr) {
+    static uint32_t a = []{
+        const char *e = getenv("LUNARIA_TRACE_FUTEX_ADDR");
+        return e ? (uint32_t)strtoul(e, nullptr, 16) : 0u;
+    }();
+    return a && a == uaddr;
+}
 /* futex waiters: tracks which addrs non-main threads are currently blocking on */
 static std::map<uint32_t, uint32_t> g_futex_wait_addrs; /* uaddr → count of waiting threads */
 
@@ -2613,9 +2632,14 @@ static void fire_choreographer_callback(ArmExecCtx &ctx, uint32_t fn_va, uint32_
 }
 
 /* glMapBufferRange shadows: host pointers can't be exposed to the guest, so
- * each mapping gets a guest-side buffer copied back on flush/unmap. */
+ * each mapping gets a guest-side buffer copied back on flush/unmap.  Keyed by
+ * the BUFFER OBJECT bound to the target at map time — a target is just a bind
+ * point, and Unity maps several buffers through GL_COPY_WRITE_BUFFER
+ * back-to-back (rebinding between maps), so a target-keyed table dropped the
+ * first mapping and its vertex data never reached the host (black UI). */
 struct GlMappedBuf { void *host; uint32_t gva, len, access; };
-static std::map<uint32_t, GlMappedBuf> g_gl_mapped;   /* keyed by GL target */
+static std::map<uint32_t, GlMappedBuf> g_gl_mapped;    /* keyed by buffer name */
+static std::map<uint32_t, uint32_t> g_gl_bound_bufs;   /* target → buffer name */
 /* GLsync handles: guest sees index+1 into this table (host GLsync is 64-bit) */
 static std::vector<void*> g_gl_syncs;
 
@@ -2920,6 +2944,7 @@ GL_DECL(void,    glDeleteSync,           void*)
 GL_DECL(void,    glInvalidateFramebuffer, GLenum,GLsizei,const GLenum*)
 GL_DECL(void,    glDetachShader,         GLuint,GLuint)
 GL_DECL(void,    glDrawBuffers,          GLsizei,const GLenum*)
+GL_DECL(void,    glDrawElementsBaseVertex, GLenum,GLsizei,GLenum,const void*,GLint)
 
 static void load_gl_procs() {
     g_libgles2 = dlopen("libGLESv2.so.2", RTLD_LAZY | RTLD_GLOBAL);
@@ -2989,9 +3014,56 @@ static void load_gl_procs() {
     GL_LOAD(glProgramParameteri); GL_LOAD(glGetProgramBinary); GL_LOAD(glProgramBinary);
     GL_LOAD(glFenceSync); GL_LOAD(glClientWaitSync); GL_LOAD(glDeleteSync);
     GL_LOAD(glInvalidateFramebuffer); GL_LOAD(glDetachShader); GL_LOAD(glDrawBuffers);
+    GL_LOAD(glDrawElementsBaseVertex);
+    if (!pfn_glDrawElementsBaseVertex)   /* GLES 3.2 core; try the EXT/OES forms */
+        pfn_glDrawElementsBaseVertex = (decltype(pfn_glDrawElementsBaseVertex))
+            eglGetProcAddress("glDrawElementsBaseVertexEXT");
+    if (!pfn_glDrawElementsBaseVertex)
+        pfn_glDrawElementsBaseVertex = (decltype(pfn_glDrawElementsBaseVertex))
+            eglGetProcAddress("glDrawElementsBaseVertexOES");
     fprintf(stderr, "[arm_exec] GL procs loaded (%s, GLES3 %s)\n",
             pfn_glCreateProgram ? "ok" : "FAILED",
             pfn_glGetProgramInterfaceiv ? "ok" : "missing");
+}
+
+/* Draw-call tracing: first 12 draws always; LUNARIA_GLDRAW_RANGE=lo:hi
+ * extends it to any g_gl_draw_count window (e.g. past the splash). */
+static bool gldraw_traced() {
+    if (g_gl_draw_count <= 12) return true;
+    static uint64_t lo = 0, hi = 0;
+    static bool init = false;
+    if (!init) {
+        init = true;
+        if (const char *e = getenv("LUNARIA_GLDRAW_RANGE")) {
+            unsigned long long a = 0, b = 0;
+            if (sscanf(e, "%llu:%llu", &a, &b) == 2) { lo = a; hi = b; }
+        }
+    }
+    return hi && g_gl_draw_count >= lo && g_gl_draw_count <= hi;
+}
+
+static void gldraw_dump_state() {
+    if (!pfn_glGetIntegerv) return;
+    GLint prog = 0, vbo = 0, ibo = 0, fbo = 0, tex = 0, vp[4] = {0,0,0,0};
+    GLint depth = 0, cull = 0, blend = 0, scis = 0;
+    pfn_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &prog);
+    pfn_glGetIntegerv(0x8894 /* ARRAY_BUFFER_BINDING */, &vbo);
+    pfn_glGetIntegerv(0x8895 /* ELEMENT_ARRAY_BUFFER_BINDING */, &ibo);
+    pfn_glGetIntegerv(0x8CA6 /* FRAMEBUFFER_BINDING */, &fbo);
+    pfn_glGetIntegerv(0x8069 /* TEXTURE_BINDING_2D */, &tex);
+    pfn_glGetIntegerv(0x0BA2 /* VIEWPORT */, vp);
+    if (pfn_glIsEnabled) {
+        depth = pfn_glIsEnabled(0x0B71 /* DEPTH_TEST */);
+        cull  = pfn_glIsEnabled(0x0B44 /* CULL_FACE */);
+        blend = pfn_glIsEnabled(0x0BE2 /* BLEND */);
+        scis  = pfn_glIsEnabled(0x0C11 /* SCISSOR_TEST */);
+    }
+    fprintf(stderr, "[gl]   state: prog=%d fbo=%d tex2d=%d vbo=%d ibo=%d "
+            "depth=%d cull=%d blend=%d scissor=%d vp=%d,%d,%dx%d "
+            "(guest vbo=%u ibo=%u)\n",
+            prog, fbo, tex, vbo, ibo, depth, cull, blend, scis,
+            vp[0], vp[1], vp[2], vp[3],
+            g_gl_bound_array_buf, g_gl_bound_elem_buf);
 }
 
 /* ---- Touch input: GLFW mouse → Android MotionEvent bridge -----------------
@@ -3604,6 +3676,26 @@ static bool apk_path_list_dir(const char *path,
     return false;
 }
 
+/* Android filesystem prefixes that exist on every device but not on the
+ * host — remapped into a writable sandbox.  mono's BCL probes filesystem
+ * case-sensitivity by creating /data/local/tmp/CASESENSITIVETEST<guid>;
+ * without the directory that throws DirectoryNotFoundException out of the
+ * first Path/File touch and aborts the game's C# initialisation. */
+static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
+    if (!path) return path;
+    if (strncmp(path, "/data/local/tmp", 15) == 0 &&
+        (path[15] == '\0' || path[15] == '/')) {
+        static const char *root = [] {
+            const char *r = "/tmp/lunaria-data-local-tmp";
+            mkdir(r, 0755);
+            return r;
+        }();
+        snprintf(buf, bufsz, "%s%s", root, path + 15);
+        return buf;
+    }
+    return path;
+}
+
 /* Host open() for a guest path string (file:// URI, APK asset fallback). */
 static int guest_open_path(const char *path, int flags, mode_t mode) {
     if (!path) return -1;
@@ -3614,6 +3706,8 @@ static int guest_open_path(const char *path, int flags, mode_t mode) {
             if (sl) path = sl;
         }
     }
+    char mapped[PATH_MAX];
+    path = map_guest_path(path, mapped, sizeof mapped);
     int fd = open(path, flags, mode);
     if (fd < 0) {
         char cache[PATH_MAX];
@@ -4909,6 +5003,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (cmd != 0u && cmd != 9u) { /* FUTEX_WAKE / FUTEX_REQUEUE etc. */
                 uint32_t nwake = (r2 == 0u) ? 1u : std::min(r2, 256u);
                 g_futex_wake_tokens[r0] += nwake;
+                if (ftrace_addr(r0))
+                    fprintf(stderr, "[ftrace] WAKE/raw uaddr=0x%08x word=0x%08x nwake=%u "
+                            "tokens=%u tid=%u lr=0x%08x\n", r0, ctx.mem.read32(r0),
+                            nwake, g_futex_wake_tokens[r0], g_current_tid, regs[14]);
                 auto wa = g_futex_wait_addrs.find(r0);
                 if (wa != g_futex_wait_addrs.end()) {
                     uint32_t woke = std::min(nwake, wa->second);
@@ -4941,7 +5039,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 for (int spin = 0; spin < spin_limit && !changed; ++spin) {
                     schedule_threads(20'000'000ULL);
                     drive_aaudio_callbacks(ctx);
-                drive_java_choreographer(ctx);
                     drive_java_choreographer(ctx);
                     if (ctx.mem.read32(r0) != r2) changed = true;
                     auto tok = g_futex_wake_tokens.find(r0);
@@ -4954,6 +5051,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             } else {
                 /* non-main worker: park until a matching FUTEX_WAKE (see the
  * SVC_SYSCALL futex path for the rationale). */
+                if (ftrace_addr(r0))
+                    fprintf(stderr, "[ftrace] PARK/raw uaddr=0x%08x expected=0x%08x "
+                            "word=0x%08x tid=%u lr=0x%08x\n", r0, r2,
+                            ctx.mem.read32(r0), g_current_tid, regs[14]);
                 g_futex_wait_addrs[r0]++;
                 for (auto &t : g_threads) {
                     if (t.id != g_current_tid) continue;
@@ -6995,6 +7096,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_BindBuffer:
         if (r0 == 0x8892u) g_gl_bound_array_buf = r1;
         else if (r0 == 0x8893u) g_gl_bound_elem_buf = r1;
+        g_gl_bound_bufs[r0] = r1;   /* all targets, for MapBufferRange keys */
         if (pfn_glBindBuffer) pfn_glBindBuffer((GLenum)r0,(GLuint)r1); break;
     case SVC_GL_BufferData:
         if (pfn_glBufferData) pfn_glBufferData((GLenum)r0,(GLsizeiptr)r1,ARM_CPTR(r2),(GLenum)r3); break;
@@ -7345,10 +7447,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_DrawArrays:
         ++g_gl_draw_count;
         if (pfn_glDrawArrays) pfn_glDrawArrays((GLenum)r0,(GLint)r1,(GLsizei)r2);
-        if (g_gl_draw_count <= 12 && pfn_glGetError) {
+        if (gldraw_traced() && pfn_glGetError) {
             GLenum e = pfn_glGetError();
             fprintf(stderr, "[gl] DrawArrays#%llu mode=0x%x first=%d count=%d err=0x%x\n",
                     (unsigned long long)g_gl_draw_count, r0, (int)r1, (int)r2, e);
+            gldraw_dump_state();
         }
         break;
     case SVC_GL_DrawElements:
@@ -7356,23 +7459,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ++g_gl_draw_count;
         if (pfn_glDrawElements) pfn_glDrawElements((GLenum)r0,(GLsizei)r1,(GLenum)r2,
             g_gl_bound_elem_buf ? (const void*)(uintptr_t)r3 : ARM_CPTR(r3));
-        if (g_gl_draw_count <= 12 && pfn_glGetError) {
+        if (gldraw_traced() && pfn_glGetError) {
             GLenum e = pfn_glGetError();
             fprintf(stderr, "[gl] DrawElements#%llu mode=0x%x count=%d type=0x%x err=0x%x\n",
                     (unsigned long long)g_gl_draw_count, r0, (int)r1, r2, e);
-        }
-        if (getenv("LUNARIA_TRACE_GLDRAW") && g_gl_draw_count <= 12 && pfn_glGetIntegerv) {
-            GLint prog = 0, vbo = 0, ibo = 0, depth = 0, cull = 0;
-            pfn_glGetIntegerv(0x8B8D /* CURRENT_PROGRAM */, &prog);
-            pfn_glGetIntegerv(0x8894 /* ARRAY_BUFFER_BINDING */, &vbo);
-            pfn_glGetIntegerv(0x8895 /* ELEMENT_ARRAY_BUFFER_BINDING */, &ibo);
-            if (pfn_glIsEnabled) {
-                depth = pfn_glIsEnabled(0x0B71 /* DEPTH_TEST */);
-                cull  = pfn_glIsEnabled(0x0B44 /* CULL_FACE */);
-            }
-            fprintf(stderr, "[gl]   state: prog=%d vbo=%d ibo=%d depth=%d cull=%d "
-                    "(guest vbo=%u ibo=%u)\n", prog, vbo, ibo, depth, cull,
-                    g_gl_bound_array_buf, g_gl_bound_elem_buf);
+            gldraw_dump_state();
         }
         break;
 
@@ -7610,6 +7701,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_LIBC_FOPEN: {
         const char *path = ctx.mem.cstr(r0);
         const char *mode = ctx.mem.cstr(r1);
+        char fo_mapped[PATH_MAX];
+        path = map_guest_path(path, fo_mapped, sizeof fo_mapped);
         /* mono try_open_assembly passes "file:///abs/path" to fopen; strip scheme. */
         if (path && strncmp(path, "file://", 7) == 0) {
             path += 7;
@@ -7687,6 +7780,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_LIBC_STAT: {
         struct stat st;
         const char *path = ctx.mem.cstr(r0);
+        char mapped[PATH_MAX];
+        path = map_guest_path(path, mapped, sizeof mapped);
         if (getenv("LUNARIA_TRACE_OPEN"))
             fprintf(stderr, "[stat] %s\n", path ? path : "(null)");
         int rc = path ? stat(path, &st) : -1;
@@ -7920,6 +8015,47 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
 
+    case SVC_EXC_CXA_THROW: {
+        /* __cxa_throw(thrown=r0, tinfo=r1, dtor=r2).  For IL2CPP the thrown
+         * object is an Il2CppExceptionWrapper { Il2CppException *ex }; the
+         * Il2CppObject header starts with the Il2CppClass*, whose name and
+         * namespace are stable at +8/+12 on 32-bit.  Regs stay untouched —
+         * the stub tail-calls the real libc++abi __cxa_throw after this. */
+        uint32_t ex  = (r0 && ctx.mem.ptr(r0)) ? ctx.mem.read32(r0) : 0;
+        uint32_t kls = (ex && ctx.mem.ptr(ex)) ? ctx.mem.read32(ex) : 0;
+        const char *nm = nullptr, *ns = nullptr;
+        if (kls && ctx.mem.ptr(kls + 12)) {
+            uint32_t pn = ctx.mem.read32(kls + 8);
+            uint32_t ps = ctx.mem.read32(kls + 12);
+            if (pn && ctx.mem.ptr(pn)) nm = (const char*)ctx.mem.ptr(pn);
+            if (ps && ctx.mem.ptr(ps)) ns = (const char*)ctx.mem.ptr(ps);
+        }
+        fprintf(stderr, "[exc] __cxa_throw ex=0x%08x class=%s.%s lr=0x%08x tid=%u\n",
+                ex, ns && *ns ? ns : "?", nm ? nm : "?", regs[14], g_current_tid);
+        /* Probe likely Il2CppString fields (message, stack trace…) */
+        for (uint32_t off = 8; ex && off <= 0x2cu; off += 4) {
+            if (!ctx.mem.ptr(ex + off)) break;
+            uint32_t s = ctx.mem.read32(ex + off);
+            if (!s || !ctx.mem.ptr(s + 12)) continue;
+            uint32_t len = ctx.mem.read32(s + 8);
+            if (len == 0 || len > 512) continue;
+            const uint8_t *ch = ctx.mem.ptr(s + 12);
+            if (!ch) continue;
+            char buf[257]; uint32_t i = 0;
+            uint32_t want = std::min(len, (uint32_t)sizeof(buf) - 1);
+            for (; i < want; ++i) {
+                uint16_t c; memcpy(&c, ch + 2u*i, 2);
+                if (c < 0x20 || c > 0x7e) break;
+                buf[i] = (char)c;
+            }
+            if (i >= 3 && i == want) {
+                buf[i] = 0;
+                fprintf(stderr, "[exc]   [ex+0x%02x] \"%s\"\n", off, buf);
+            }
+        }
+        break;
+    }
+
     /* ---- GLES 3.x ---- */
 #define ARM_PTR(va) ((va) ? (void*)ctx.mem.ptr(va) : nullptr)
 #define ARM_CPTR(va) ((va) ? (const void*)ctx.mem.ptr(va) : nullptr)
@@ -8018,6 +8154,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         /* Host pointers can't be handed to the guest; shadow the mapping in
          * a guest buffer and copy back on flush/unmap. */
         uint32_t off = r1, len = r2, access = r3;
+        uint32_t buf = g_gl_bound_bufs[r0];
         void *host = pfn_glMapBufferRange
             ? pfn_glMapBufferRange((GLenum)r0,(intptr_t)off,(intptr_t)len,
                                    (GLbitfield)access) : nullptr;
@@ -8025,17 +8162,29 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (!gva) { ret32(0u); break; }
         if (host && (access & 0x0001u) /* GL_MAP_READ_BIT */)
             memcpy(ctx.mem.ptr(gva), host, len);
-        g_gl_mapped[r0] = { host, gva, len, access };
+        g_gl_mapped[buf] = { host, gva, len, access };
+        {
+            static int n = 0;
+            if (n++ < 24)
+                fprintf(stderr, "[gl] MapBufferRange target=0x%x buf=%u off=%u "
+                        "len=%u access=0x%x host=%p → gva=0x%08x\n",
+                        r0, buf, off, len, access, host, gva);
+        }
         ret32(gva);
         break;
     }
     case SVC_GL3_UnmapBuffer: {
-        auto it = g_gl_mapped.find(r0);
+        auto it = g_gl_mapped.find(g_gl_bound_bufs[r0]);
         if (it != g_gl_mapped.end()) {
             auto &m = it->second;
             /* GL_MAP_WRITE_BIT without GL_MAP_FLUSH_EXPLICIT_BIT */
             if (m.host && (m.access & 0x0002u) && !(m.access & 0x0010u))
                 memcpy(m.host, ctx.mem.ptr(m.gva), m.len);
+            static int n = 0;
+            if (n++ < 24)
+                fprintf(stderr, "[gl] UnmapBuffer target=0x%x buf=%u len=%u "
+                        "copied=%d\n", r0, it->first, m.len,
+                        (m.host && (m.access & 0x0002u) && !(m.access & 0x0010u)) ? 1 : 0);
             arm_free(ctx, m.gva);
             g_gl_mapped.erase(it);
         }
@@ -8043,12 +8192,17 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         break;
     }
     case SVC_GL3_FlushMappedBufferRange: {
-        auto it = g_gl_mapped.find(r0);
+        auto it = g_gl_mapped.find(g_gl_bound_bufs[r0]);
         if (it != g_gl_mapped.end()) {
             auto &m = it->second;
             uint32_t off = r1, len = r2;
             if (m.host && off + len <= m.len)
                 memcpy((char*)m.host + off, ctx.mem.ptr(m.gva + off), len);
+            static int n = 0;
+            if (n++ < 24)
+                fprintf(stderr, "[gl] FlushMappedBufferRange target=0x%x buf=%u "
+                        "off=%u len=%u copied=%d\n", r0, it->first, off, len,
+                        (m.host && off + len <= m.len) ? 1 : 0);
             if (pfn_glFlushMappedBufferRange)
                 pfn_glFlushMappedBufferRange((GLenum)r0,(intptr_t)off,(intptr_t)len);
         }
@@ -8133,6 +8287,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (pfn_glDrawBuffers)
             pfn_glDrawBuffers((GLsizei)r0,(const GLenum*)ARM_CPTR(r1));
         break;
+    case SVC_GL3_DrawElementsBaseVertex: {
+        /* (mode, count, type, indices | basevertex); IBO bound → byte offset */
+        uint32_t basevertex = ctx.mem.read32(regs[13]);
+        ++g_gl_draw_count;
+        if (pfn_glDrawElementsBaseVertex)
+            pfn_glDrawElementsBaseVertex((GLenum)r0,(GLsizei)r1,(GLenum)r2,
+                g_gl_bound_elem_buf ? (const void*)(uintptr_t)r3 : ARM_CPTR(r3),
+                (GLint)basevertex);
+        if (gldraw_traced() && pfn_glGetError) {
+            GLenum e = pfn_glGetError();
+            fprintf(stderr, "[gl] DrawElementsBaseVertex#%llu mode=0x%x count=%d "
+                    "type=0x%x idx=0x%x base=%d err=0x%x pfn=%d\n",
+                    (unsigned long long)g_gl_draw_count, r0, (int)r1, r2, r3,
+                    (int)basevertex, e, pfn_glDrawElementsBaseVertex ? 1 : 0);
+            gldraw_dump_state();
+        }
+        break;
+    }
 #undef ARM_PTR
 #undef ARM_CPTR
 
@@ -8224,9 +8396,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         case 240: { /* __NR_futex(uaddr=r1, op=r2, val=r3, timeout=[sp]) */
             uint32_t cmd = r2 & 0x7fu; /* strip FUTEX_PRIVATE_FLAG / CLOCK_REALTIME */
             if (cmd != 0u && cmd != 9u) { /* FUTEX_WAKE / FUTEX_REQUEUE etc. */
-                /* Record pending wake tokens so next futex_wait on this addr returns 0 */
-                uint32_t nwake = (r2 == 0u) ? 1u : std::min(r2, 256u);
+                /* Record pending wake tokens so next futex_wait on this addr
+                 * returns 0.  The count is val (r3) — using the op word here
+                 * made every FUTEX_WAKE_PRIVATE (0x81) deposit 129 tokens,
+                 * which turned later waits into phantom no-ops. */
+                uint32_t nwake = (r3 == 0u) ? 1u : std::min(r3, 256u);
                 g_futex_wake_tokens[r1] += nwake;
+                if (ftrace_addr(r1))
+                    fprintf(stderr, "[ftrace] WAKE uaddr=0x%08x word=0x%08x nwake=%u "
+                            "tokens=%u tid=%u lr=0x%08x\n", r1, ctx.mem.read32(r1),
+                            nwake, g_futex_wake_tokens[r1], g_current_tid, regs[14]);
                 /* Remove address from waiters map (threads are being woken) */
                 auto wa = g_futex_wait_addrs.find(r1);
                 if (wa != g_futex_wait_addrs.end()) {
@@ -8265,7 +8444,6 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 for (int spin = 0; spin < spin_limit && !changed; ++spin) {
                     schedule_threads(20'000'000ULL);
                     drive_aaudio_callbacks(ctx);
-                drive_java_choreographer(ctx);
                     drive_java_choreographer(ctx);
                     if (ctx.mem.read32(r1) != r3) changed = true;
                     /* re-check wake tokens after scheduling */
@@ -8281,6 +8459,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
  * arrives (schedule_threads skips t.waiting_futex).  Returning to a
  * busy re-run made the Baselib semaphore acquire read a phantom
  * "available" state and dispatch a NULL job. */
+                if (ftrace_addr(r1))
+                    fprintf(stderr, "[ftrace] PARK uaddr=0x%08x expected=0x%08x "
+                            "word=0x%08x tid=%u lr=0x%08x\n", r1, r3,
+                            ctx.mem.read32(r1), g_current_tid, regs[14]);
                 g_futex_wait_addrs[r1]++;
                 for (auto &t : g_threads) {
                     if (t.id != g_current_tid) continue;
@@ -8892,7 +9074,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
 
     case SVC_ACCESS: {
         const char *path = ctx.mem.cstr(r0);
-        
+        char ac_mapped[PATH_MAX];
+        path = map_guest_path(path, ac_mapped, sizeof ac_mapped);
         if (path && strncmp(path, "file://", 7) == 0) {
             const char *p = path + 7;
             if (*p == '/') {
@@ -8958,6 +9141,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_OPENDIR: {
         const char *path = ctx.mem.cstr(r0);
+        char od_mapped[PATH_MAX];
+        path = map_guest_path(path, od_mapped, sizeof od_mapped);
         DIR *d = path ? opendir(path) : nullptr;
         if (d) {
             uint32_t idx = g_dir_next++;
@@ -9591,6 +9776,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_ABS:      ret32((uint32_t)abs((int)r0)); break;
     case SVC_MKDIR: {
         const char *path = ctx.mem.cstr(r0);
+        char mk_mapped[PATH_MAX];
+        path = map_guest_path(path, mk_mapped, sizeof mk_mapped);
         ret32(path ? (uint32_t)mkdir(path, (mode_t)r1) : ~0u);
         break;
     }
@@ -9605,11 +9792,16 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_UNLINK: {
         const char *path = ctx.mem.cstr(r0);
+        char ul_mapped[PATH_MAX];
+        path = map_guest_path(path, ul_mapped, sizeof ul_mapped);
         ret32(path ? (uint32_t)unlink(path) : ~0u);
         break;
     }
     case SVC_RENAME: {
         const char *a = ctx.mem.cstr(r0), *b = ctx.mem.cstr(r1);
+        char rn_ma[PATH_MAX], rn_mb[PATH_MAX];
+        a = map_guest_path(a, rn_ma, sizeof rn_ma);
+        b = map_guest_path(b, rn_mb, sizeof rn_mb);
         ret32((a && b) ? (uint32_t)rename(a, b) : ~0u);
         break;
     }
@@ -11656,6 +11848,10 @@ static void schedule_threads(uint64_t slice) {
             } else if (!changed) {
                 continue;   /* still parked */
             }
+            if (ftrace_addr(uaddr))
+                fprintf(stderr, "[ftrace] UNPARK uaddr=0x%08x tid=%u woken=%d "
+                        "changed=%d word=0x%08x\n", uaddr, t.id, (int)woken,
+                        (int)changed, ctx.mem.read32(uaddr));
             t.waiting_futex = 0;
             auto wa = g_futex_wait_addrs.find(uaddr);
             if (wa != g_futex_wait_addrs.end() && wa->second > 0u && --wa->second == 0u)
@@ -12490,6 +12686,20 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
                 /* Defined symbol: eager-bind to base + st_value */
                 if(stab[si].st_shndx!=SHN_UNDEF){
                     uint32_t sv = base_addr + stab[si].st_value;
+                    /* libil2cpp links libc++abi statically, so its own
+                     * __cxa_throw JUMP_SLOT binds locally and would bypass
+                     * the exception logger — route it through the stub. */
+                    if(rt==R_ARM_JUMP_SLOT &&
+                       strcmp(str+stab[si].st_name,"__cxa_throw")==0){
+                        uint32_t &stub = g_exc_stub_cxa_throw[sv];
+                        if(!stub)
+                            stub = build_exc_logger_stub(ctx,
+                                EXC_STUB_BASE + 0x80u
+                                    + 0x20u * (uint32_t)(g_exc_stub_cxa_throw.size()-1),
+                                SVC_EXC_CXA_THROW, sv);
+                        ctx.mem.write32(ro, stub);
+                        continue;
+                    }
                     switch(rt){
                     case R_ARM_JUMP_SLOT:
                     case R_ARM_GLOB_DAT:
@@ -12531,6 +12741,17 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
                         g_exc_stub_raise = build_exc_logger_stub(
                             ctx, EXC_STUB_BASE + 0x40u, SVC_EXC_RAISE, exp_it->second);
                     tv = g_exc_stub_raise;
+                } else if(exp_it != g_exported_syms.end() &&
+                   strcmp(sym,"__cxa_throw")==0){
+                    /* Always-on: log which managed exception IL2CPP throws
+                     * (class + string fields) before the real unwind runs. */
+                    uint32_t &stub = g_exc_stub_cxa_throw[exp_it->second];
+                    if(!stub)
+                        stub = build_exc_logger_stub(ctx,
+                            EXC_STUB_BASE + 0x80u
+                                + 0x20u * (uint32_t)(g_exc_stub_cxa_throw.size()-1),
+                            SVC_EXC_CXA_THROW, exp_it->second);
+                    tv = stub;
                 } else if(exp_it != g_exported_syms.end() &&
                    strcmp(sym,"mono_jit_init_version")==0 && mjiv_wrap){
                     uint32_t mdg = 0;
@@ -12840,6 +13061,16 @@ static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
                     (unsigned long long)cb.ticks,
                     (unsigned)ctx.jit->Regs()[15],
                     cb.last_svc);
+            /* Render-thread probe: where is the GfxDevice worker blocked? */
+            if (getenv("LUNARIA_TRACE_RENDER"))
+                for (auto &t : g_threads)
+                    if (t.id == (uint32_t)env_ticks("LUNARIA_TRACE_RENDER", 68))
+                        fprintf(stderr, "[rt] tid=%u pc=0x%08x lr=0x%08x "
+                                "wfutex=0x%08x[val=0x%08x] wsem=0x%08x fin=%d\n",
+                                t.id, t.regs[15] & ~1u, t.regs[14] & ~1u,
+                                t.waiting_futex,
+                                t.waiting_futex ? ctx.mem.read32(t.waiting_futex) : 0,
+                                t.waiting_sem, (int)t.finished);
             hb_next += 500'000'000ULL;
             /* Also give background threads a slice so worker deps can complete */
             if (!g_scheduling && !g_threads.empty())
