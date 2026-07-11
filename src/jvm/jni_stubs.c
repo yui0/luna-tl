@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sysinfo.h>
+#include <time.h>
 #include "jvm/jni.h"
 
 extern void arm_exec_drain_gl_thread_jobs(void);
@@ -238,6 +239,29 @@ java_lang_Thread_currentThread(JNIEnv *env, jclass clazz)
    assert(env);
    static jobject sv;
    return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/lang/Thread"))));
+}
+
+/* Choreographer.getInstance() → singleton stub.  UnityChoreographer's init
+ * message (what=0) stores a GlobalRef of this at [this+0x70] and the main
+ * thread waits on cond this+0xc until it is non-NULL — returning NULL here
+ * deadlocks startup. */
+jobject
+android_view_Choreographer_getInstance(JNIEnv *env, jclass clazz)
+{
+   assert(env);
+   static jobject sv;
+   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "android/view/Choreographer"))));
+}
+
+/* Long.longValue() — unboxes the frameTimeNanos argument that doFrame(J)
+ * receives through the JNIBridge proxy Object[] args. */
+jlong
+java_lang_Long_longValue(JNIEnv *env, jobject object)
+{
+   assert(env);
+   struct timespec ts;
+   clock_gettime(CLOCK_MONOTONIC, &ts);
+   return (jlong)ts.tv_sec * 1000000000ll + ts.tv_nsec;
 }
 
 /* Return empty array so Unity's STE construction loop runs 0 iterations */

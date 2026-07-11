@@ -2,6 +2,8 @@
 
 **Run Android ARM/x86_64 JNI libraries (especially Unity's `libunity.so`) on Linux** using **dynarmic JIT** emulation! 🚀
 
+- [GitHub Sponsors](https://github.com/sponsors/yui0)
+
 ---
 
 ### ✨ Features

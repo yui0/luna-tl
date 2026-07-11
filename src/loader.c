@@ -304,14 +304,18 @@ run_jni_game_arm(struct jvm *jvm)
       const jobject fake_surf = jvm->native.AllocObject(&jvm->env,
             jvm->native.FindClass(&jvm->env, "android/view/Surface"));
       /* Unity 4.x: nativeRecreateGfxState(Landroid/view/Surface;)V  — Surface only
-       * Unity 5+ : nativeRecreateGfxState(ILandroid/view/Surface;)V — mode + Surface */
+       * Unity 5+ : nativeRecreateGfxState(ILandroid/view/Surface;)V — displayId + Surface
+       * Java 側は updateGLDisplay(0, surface) で主ディスプレイ=0 を渡す。
+       * 1 を渡すと Surface が G[1] に格納され、メインスレッドが待つ G[0]
+       * (libunity 0x02e601a0 相当) が永遠に 0 のまま cond_wait でデッドロック
+       * する (Unity 2023 IL2CPP で確認)。 */
       int unity4_sig = (recreate_sig[0] == '(' && recreate_sig[1] == 'L');
       if (unity4_sig) {
          fprintf(stderr, "[loader] calling nativeRecreateGfxState (Unity4 surface-only)...\n");
          arm_exec_call(va_recreate, env, ctx, (uint32_t)(uintptr_t)fake_surf, 0);
       } else {
-         fprintf(stderr, "[loader] calling nativeRecreateGfxState (mode=1)...\n");
-         arm_exec_call(va_recreate, env, ctx, 1, (uint32_t)(uintptr_t)fake_surf);
+         fprintf(stderr, "[loader] calling nativeRecreateGfxState (displayId=0)...\n");
+         arm_exec_call(va_recreate, env, ctx, 0, (uint32_t)(uintptr_t)fake_surf);
       }
       arm_exec_run_pending_threads();
       fprintf(stderr, "[loader] nativeRecreateGfxState done\n");
