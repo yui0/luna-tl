@@ -10,6 +10,18 @@
 
 #include "jni.h"
 #include <stdbool.h>
+#include <stdlib.h>
+
+/* Android 実機の getPackageCodePath() / ApplicationInfo.sourceDir は APK ファイル
+ * パスを返す。lunaria-apk.sh は展開先を ANDROID_PACKAGE_CODE_PATH に置くので、
+ * JNI では ANDROID_APK_FILE を優先する。 */
+static inline const char *lunaria_apk_mount_path(void)
+{
+   const char *apk = getenv("ANDROID_APK_FILE");
+   if (apk && *apk)
+      return apk;
+   return getenv("ANDROID_PACKAGE_CODE_PATH");
+}
 
 struct jvm_string {
    const char *data;
@@ -94,3 +106,9 @@ jvm_init(struct jvm *jvm);
 
 struct jvm*
 jnienv_get_jvm(JNIEnv *env);
+
+/* Per-File path storage (java/io/File). jobject handles index this table. */
+void jni_file_set_path(jobject file, const char *path);
+const char *jni_file_get_path(jobject file);
+void jni_file_bind_ctor(JNIEnv *env, jobject file, jmethodID ctor, va_list ap);
+void jni_file_bind_ctor_a(JNIEnv *env, jobject file, jmethodID ctor, const jvalue *args);

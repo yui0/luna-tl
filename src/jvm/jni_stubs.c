@@ -20,13 +20,167 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/sysinfo.h>
 #include <time.h>
+#include <unistd.h>
 #include "jvm/jni.h"
+#include "jvm.h"
 
 extern void arm_exec_drain_gl_thread_jobs(void);
 const char *arm_exec_get_main_lib_dir(void);
 
+#define JNI_FILE_PATHS_MAX 65536u
+static char *g_file_paths[JNI_FILE_PATHS_MAX];
+
+void
+jni_file_set_path(jobject file, const char *path)
+{
+   if (!file)
+      return;
+   uintptr_t idx = (uintptr_t)file;
+   if (idx >= JNI_FILE_PATHS_MAX)
+      return;
+   free(g_file_paths[idx]);
+   g_file_paths[idx] = (path && *path) ? strdup(path) : NULL;
+}
+
+const char *
+jni_file_get_path(jobject file)
+{
+   if (!file)
+      return NULL;
+   uintptr_t idx = (uintptr_t)file;
+   return (idx < JNI_FILE_PATHS_MAX) ? g_file_paths[idx] : NULL;
+}
+
+static void
+jni_file_join(char *out, size_t outsz, const char *parent, const char *child)
+{
+   if (!parent || !*parent) {
+      snprintf(out, outsz, "%s", child ? child : "");
+      return;
+   }
+   if (!child || !*child) {
+      snprintf(out, outsz, "%s", parent);
+      return;
+   }
+   const size_t plen = strlen(parent);
+   if (plen > 0 && parent[plen - 1] == '/')
+      snprintf(out, outsz, "%s%s", parent, child);
+   else
+      snprintf(out, outsz, "%s/%s", parent, child);
+}
+
+static const char *
+jni_file_default_dir(void)
+{
+   const char *p = getenv("ANDROID_EXTERNAL_FILES_DIR");
+   return (p && *p) ? p : "/tmp";
+}
+
+static jstring
+jni_file_path_string(JNIEnv *env, jobject object)
+{
+   const char *p = jni_file_get_path(object);
+   if (!p || !*p)
+      p = jni_file_default_dir();
+   return (*env)->NewStringUTF(env, p);
+}
+
+void
+jni_file_bind_ctor(JNIEnv *env, jobject file, jmethodID ctor, va_list ap)
+{
+   struct jvm *jvm = jnienv_get_jvm(env);
+   if (!jvm || !file || !ctor)
+      return;
+   struct jvm_object *m = &jvm->objects[(uintptr_t)ctor - 1];
+   if (m->type != JVM_OBJECT_METHOD || !m->method.signature.data)
+      return;
+   const char *sig = m->method.signature.data;
+   char path[PATH_MAX];
+   if (!strcmp(sig, "(Ljava/lang/String;)V")) {
+      jstring js = va_arg(ap, jstring);
+      const char *utf = js ? (*env)->GetStringUTFChars(env, js, NULL) : NULL;
+      if (utf) {
+         jni_file_set_path(file, utf);
+         (*env)->ReleaseStringUTFChars(env, js, utf);
+      }
+   } else if (!strcmp(sig, "(Ljava/io/File;Ljava/lang/String;)V")) {
+      jobject parent = va_arg(ap, jobject);
+      jstring child = va_arg(ap, jstring);
+      const char *base = jni_file_get_path(parent);
+      if (!base)
+         base = jni_file_default_dir();
+      const char *utf = child ? (*env)->GetStringUTFChars(env, child, NULL) : NULL;
+      if (utf) {
+         jni_file_join(path, sizeof path, base, utf);
+         jni_file_set_path(file, path);
+         (*env)->ReleaseStringUTFChars(env, child, utf);
+      }
+   } else if (!strcmp(sig, "(Ljava/lang/String;Ljava/lang/String;)V")) {
+      jstring p1 = va_arg(ap, jstring);
+      jstring p2 = va_arg(ap, jstring);
+      const char *u1 = p1 ? (*env)->GetStringUTFChars(env, p1, NULL) : NULL;
+      const char *u2 = p2 ? (*env)->GetStringUTFChars(env, p2, NULL) : NULL;
+      if (u1 && u2) {
+         jni_file_join(path, sizeof path, u1, u2);
+         jni_file_set_path(file, path);
+      } else if (u1) {
+         jni_file_set_path(file, u1);
+      }
+      if (u1)
+         (*env)->ReleaseStringUTFChars(env, p1, u1);
+      if (u2)
+         (*env)->ReleaseStringUTFChars(env, p2, u2);
+   }
+}
+
+void
+jni_file_bind_ctor_a(JNIEnv *env, jobject file, jmethodID ctor, const jvalue *args)
+{
+   struct jvm *jvm = jnienv_get_jvm(env);
+   if (!jvm || !file || !ctor || !args)
+      return;
+   struct jvm_object *m = &jvm->objects[(uintptr_t)ctor - 1];
+   if (m->type != JVM_OBJECT_METHOD || !m->method.signature.data)
+      return;
+   const char *sig = m->method.signature.data;
+   char path[PATH_MAX];
+   if (!strcmp(sig, "(Ljava/lang/String;)V")) {
+      jstring js = (jstring)args[0].l;
+      const char *utf = js ? (*env)->GetStringUTFChars(env, js, NULL) : NULL;
+      if (utf) {
+         jni_file_set_path(file, utf);
+         (*env)->ReleaseStringUTFChars(env, js, utf);
+      }
+   } else if (!strcmp(sig, "(Ljava/io/File;Ljava/lang/String;)V")) {
+      jobject parent = (jobject)args[0].l;
+      jstring child = (jstring)args[1].l;
+      const char *base = jni_file_get_path(parent);
+      if (!base)
+         base = jni_file_default_dir();
+      const char *utf = child ? (*env)->GetStringUTFChars(env, child, NULL) : NULL;
+      if (utf) {
+         jni_file_join(path, sizeof path, base, utf);
+         jni_file_set_path(file, path);
+         (*env)->ReleaseStringUTFChars(env, child, utf);
+      }
+   } else if (!strcmp(sig, "(Ljava/lang/String;Ljava/lang/String;)V")) {
+      jstring p1 = (jstring)args[0].l;
+      jstring p2 = (jstring)args[1].l;
+      const char *u1 = p1 ? (*env)->GetStringUTFChars(env, p1, NULL) : NULL;
+      const char *u2 = p2 ? (*env)->GetStringUTFChars(env, p2, NULL) : NULL;
+      if (u1 && u2) {
+         jni_file_join(path, sizeof path, u1, u2);
+         jni_file_set_path(file, path);
+      } else if (u1) {
+         jni_file_set_path(file, u1);
+      }
+      if (u1)
+         (*env)->ReleaseStringUTFChars(env, p1, u1);
+      if (u2)
+         (*env)->ReleaseStringUTFChars(env, p2, u2);
+   }
+}
 
 
 /* Forward declaration — implemented in arm_exec.cpp */
@@ -107,10 +261,63 @@ java_lang_ClassLoader_findLibrary(JNIEnv *env, jobject object, va_list args)
    const char *libname = (*env)->GetStringUTFChars(env, va_arg(args, jstring), NULL);
    const char *libdir = arm_exec_get_main_lib_dir();
    char lib[4096];
-   if (libdir && *libdir)
-       snprintf(lib, sizeof(lib), "%s/lib%s.so", libdir, libname ? libname : "");
-   else
-       snprintf(lib, sizeof(lib), "lib%s.so", libname ? libname : "");
+   lib[0] = '\0';
+   if (!libname || !*libname)
+      return NULL;
+   /* Full path: as-is, then +.so (mono probes without the suffix first). */
+   if (strchr(libname, '/')) {
+      if (access(libname, F_OK) == 0)
+         snprintf(lib, sizeof(lib), "%s", libname);
+      else {
+         size_t n = strlen(libname);
+         if (n + 4 < sizeof(lib) && (n < 3 || strcmp(libname + n - 3, ".so") != 0)) {
+            snprintf(lib, sizeof(lib), "%s.so", libname);
+            if (access(lib, F_OK) != 0) lib[0] = '\0';
+         }
+      }
+   } else {
+      /* Bare name: try Android spellings under the APK lib dir. */
+      size_t nl = strlen(libname);
+      int has_so = nl > 3 && !strcmp(libname + nl - 3, ".so");
+      int has_lib = nl > 3 && !strncmp(libname, "lib", 3);
+      char cand[4096];
+      int i, ntry = 0;
+      const char *cands[4];
+      if (libdir && *libdir) {
+         if (has_so) {
+            snprintf(cand, sizeof(cand), "%s/%s", libdir, libname);
+            cands[ntry++] = cand;
+         } else if (has_lib) {
+            static char a[4096], b[4096];
+            snprintf(a, sizeof(a), "%s/%s.so", libdir, libname);
+            snprintf(b, sizeof(b), "%s/%s", libdir, libname);
+            cands[ntry++] = a; cands[ntry++] = b;
+         } else {
+            static char a[4096], b[4096], c[4096], d[4096];
+            snprintf(a, sizeof(a), "%s/lib%s.so", libdir, libname);
+            snprintf(b, sizeof(b), "%s/%s.so", libdir, libname);
+            snprintf(c, sizeof(c), "%s/lib%s", libdir, libname);
+            snprintf(d, sizeof(d), "%s/%s", libdir, libname);
+            cands[ntry++] = a; cands[ntry++] = b;
+            cands[ntry++] = c; cands[ntry++] = d;
+         }
+      } else if (has_so) {
+         cands[ntry++] = libname;
+      } else if (has_lib) {
+         snprintf(cand, sizeof(cand), "%s.so", libname);
+         cands[ntry++] = cand;
+      } else {
+         snprintf(cand, sizeof(cand), "lib%s.so", libname);
+         cands[ntry++] = cand;
+      }
+      for (i = 0; i < ntry; ++i) {
+         if (access(cands[i], F_OK) == 0) {
+            snprintf(lib, sizeof(lib), "%s", cands[i]);
+            break;
+         }
+      }
+   }
+   if (!lib[0]) return NULL;
    return (*env)->NewStringUTF(env, lib);
 }
 
@@ -181,16 +388,20 @@ jstring
 java_io_File_getPath(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   // FIXME: see comment on `android_content_Context_getExternalFilesDir`
-   return (*env)->NewStringUTF(env, getenv("ANDROID_EXTERNAL_FILES_DIR"));
+   (void)args;
+   return jni_file_path_string(env, object);
 }
 
 jstring
 java_io_File_getParent(JNIEnv *env, jobject object, va_list args)
 {
-   // FIXME: see comment on `android_content_Context_getExternalFilesDir`
-   char path[4096];
-   snprintf(path, sizeof(path), "%s", getenv("ANDROID_EXTERNAL_FILES_DIR"));
+   assert(env && object);
+   (void)args;
+   char path[PATH_MAX];
+   const char *p = jni_file_get_path(object);
+   if (!p || !*p)
+      p = jni_file_default_dir();
+   snprintf(path, sizeof path, "%s", p);
    return (*env)->NewStringUTF(env, dirname(path));
 }
 
@@ -474,7 +685,8 @@ jstring
 android_content_Context_getPackageCodePath(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   return (*env)->NewStringUTF(env, getenv("ANDROID_PACKAGE_CODE_PATH"));
+   const char *apk = lunaria_apk_mount_path();
+   return (*env)->NewStringUTF(env, (apk && *apk) ? apk : "");
 }
 
 jstring
@@ -488,24 +700,32 @@ jobject
 android_content_Context_getExternalFilesDir(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   // FIXME: add mechanism that allows us to implement these objects and then
-   //        use `$XDG_DATA_HOME/lunaria/appid` for the path
-   // The ARM JNI bridge dispatches through CallObjectMethodA with a NULL
-   // argument vector, so `args` may be NULL — only consume it when present.
-   if (args) {
-      jstring str = va_arg(args, jstring);
-      (*env)->GetStringUTFChars(env, str, NULL);
-   }
+   /* Do not va_arg(args): Call*MethodA is invoked with nullptr, and a non-null
+    * pointer here is often a host jvalue[] / garbage — not a real va_list. */
+   (void)args;
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"))));
+   if (!sv) {
+      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
+      const char *p = getenv("ANDROID_EXTERNAL_FILES_DIR");
+      jni_file_set_path(sv, (p && *p) ? p : "/tmp");
+   }
+   return sv;
 }
 
 jobject
 android_content_Context_getFilesDir(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
+   (void)args;
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"))));
+   if (!sv) {
+      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
+      const char *p = getenv("ANDROID_PACKAGE_CODE_PATH");
+      if (!p || !*p)
+         p = getenv("ANDROID_EXTERNAL_FILES_DIR");
+      jni_file_set_path(sv, (p && *p) ? p : "/tmp");
+   }
+   return sv;
 }
 
 jobject
@@ -532,7 +752,8 @@ jstring
 android_content_pm_ApplicationInfo_sourceDir(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   return (*env)->NewStringUTF(env, getenv("ANDROID_PACKAGE_CODE_PATH"));
+   const char *apk = lunaria_apk_mount_path();
+   return (*env)->NewStringUTF(env, (apk && *apk) ? apk : "");
 }
 
 jobject
@@ -922,13 +1143,13 @@ android_content_Context_getObbDirs(JNIEnv *env, jobject object, va_list args)
    return (*env)->NewObjectArray(env, 0, (*env)->FindClass(env, "java/io/File"), NULL);
 }
 
-/* File.getAbsolutePath() → the app's external files dir (best available path). */
+/* File.getAbsolutePath() → stored path for this File object. */
 jstring
 java_io_File_getAbsolutePath(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
-   const char *p = getenv("ANDROID_EXTERNAL_FILES_DIR");
-   return (*env)->NewStringUTF(env, p ? p : "/tmp");
+   (void)args;
+   return jni_file_path_string(env, object);
 }
 
 /* Context.getSystemService(name) → a generic stub service object.  Unity asks
@@ -1499,13 +1720,14 @@ jboolean java_lang_Class_lowMemory(JNIEnv *env, jobject obj)
 
 /* ActivityManager.getMemoryInfo(ActivityManager.MemoryInfo outInfo) — void method.
  * Unity queries this to decide how aggressively to trim the asset cache and
- * whether to trigger a GC pass.  We populate outInfo's fields from the real
- * Linux sysinfo(2) so that the engine's memory-pressure heuristics work
- * correctly both in windowed and headless modes:
+ * whether to trigger a GC pass.  We populate outInfo's fields with a fixed
+ * 32-bit guest memory profile consistent with the synthetic /proc/meminfo —
+ * NOT the host's figures, which would leak a desktop's tens-of-GB totalram and
+ * cache-driven freeram dips into the engine's heuristics:
  *
- *   availMem  — free + buffered RAM in bytes  (sysinfo.freeram + bufferram)
- *   totalMem  — total physical RAM in bytes   (sysinfo.totalram)
- *   lowMemory — true when availMem < threshold
+ *   availMem  — ~1.7 GB (matches /proc/meminfo MemAvailable)
+ *   totalMem  — 2 GB     (matches /proc/meminfo MemTotal)
+ *   lowMemory — true when availMem < threshold (always false here)
  *   threshold — 48 MB: below this Unity starts releasing cached assets
  *
  * Field IDs are looked up once and cached. If the JNI FindClass/GetFieldID
@@ -1523,18 +1745,21 @@ android_app_ActivityManager_getMemoryInfo(JNIEnv *env, jobject obj, va_list args
    if (!out_info)
       return;
 
-   /* Query real host memory figures. */
-   struct sysinfo si;
-   if (sysinfo(&si) != 0)
-      return;
+   /* Report a fixed 32-bit guest memory profile, NOT the host's figures.
+    * The host sysinfo(2) is doubly wrong here: on a desktop it reports tens of
+    * GB of totalram (Unity's MemoryManager then sizes its heaps far past the
+    * 4 GB guest arena until arm_malloc() throws bad_alloc), while freeram can
+    * momentarily dip below the low-memory threshold because of filesystem
+    * caches (Unity then aggressively releases assets mid-load).  These figures
+    * must also stay consistent with the synthetic /proc/meminfo the emulator
+    * hands the Boehm GC (2 GB total / ~1.7 GB available); otherwise the two
+    * memory oracles disagree and the engine's trim heuristics oscillate. */
+   static const jlong TOTAL_BYTES = 2048L * 1024 * 1024; /* 2 GB, matches /proc/meminfo MemTotal */
+   static const jlong AVAIL_BYTES = 1728L * 1024 * 1024; /* ~1.7 GB, matches MemAvailable */
+   jlong total_bytes = TOTAL_BYTES;
+   jlong avail_bytes = AVAIL_BYTES;
 
-   jlong avail_bytes = (jlong)si.freeram  * (jlong)si.mem_unit
-                     + (jlong)si.bufferram * (jlong)si.mem_unit;
-   jlong total_bytes = (jlong)si.totalram  * (jlong)si.mem_unit;
-
-   /* 48 MB low-memory threshold — matches the default Android Go threshold and
-    * is conservative enough to keep Unity from over-releasing on a desktop box
-    * that reports a small freeram slice due to filesystem caches. */
+   /* 48 MB low-memory threshold — matches the default Android Go threshold. */
    static const jlong THRESHOLD = 48L * 1024 * 1024;
    jboolean low = (avail_bytes < THRESHOLD) ? JNI_TRUE : JNI_FALSE;
 
@@ -1806,18 +2031,32 @@ jmethodID
 com_unity3d_player_ReflectionHelper_getMethodID(JNIEnv *env, jobject object, jvalue *values)
 {
    assert(env && object);
+   /* Fake-JVM stand-in for the Java method (not a RegisterNatives entry).
+    * Call*MethodA used to pass nullptr — guard so a missed marshal cannot
+    * take down the host.  Dex: (Class,String,String,Z)->Method.
+    * Caller must provide 4 jvalues (Z may be 0); unit tests do the same. */
+   if (!values || !values[0].l || !values[1].l || !values[2].l)
+      return NULL;
    const char *utf1 = (*env)->GetStringUTFChars(env, values[1].l, NULL);
    const char *utf2 = (*env)->GetStringUTFChars(env, values[2].l, NULL);
-   return (*env)->GetMethodID(env, values[0].l, utf1, utf2);
+   if (!utf1 || !utf2) return NULL;
+   if (values[3].z)
+      return (*env)->GetStaticMethodID(env, (jclass)values[0].l, utf1, utf2);
+   return (*env)->GetMethodID(env, (jclass)values[0].l, utf1, utf2);
 }
 
 jfieldID
 com_unity3d_player_ReflectionHelper_getFieldID(JNIEnv *env, jobject object, jvalue *values)
 {
    assert(env && object);
+   if (!values || !values[0].l || !values[1].l || !values[2].l)
+      return NULL;
    const char *utf1 = (*env)->GetStringUTFChars(env, values[1].l, NULL);
    const char *utf2 = (*env)->GetStringUTFChars(env, values[2].l, NULL);
-   return (*env)->GetFieldID(env, values[0].l, utf1, utf2);
+   if (!utf1 || !utf2) return NULL;
+   if (values[3].z)
+      return (*env)->GetStaticFieldID(env, (jclass)values[0].l, utf1, utf2);
+   return (*env)->GetFieldID(env, (jclass)values[0].l, utf1, utf2);
 }
 
 /* Unity queues callbacks from native threads to run on the Java main thread.

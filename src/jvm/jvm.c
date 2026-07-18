@@ -523,12 +523,29 @@ JNIEnv_AllocObject(JNIEnv* p0, jclass p1)
    return jvm_add_object_if_not_there(jnienv_get_jvm(p0), &o);
 }
 
+static bool
+jvm_class_is(struct jvm *jvm, jclass cls, const char *name)
+{
+   if (!jvm || !cls || !name)
+      return false;
+   struct jvm_object *ko = jvm_get_object(jvm, cls);
+   return ko && ko->type == JVM_OBJECT_CLASS && ko->klass.name.data &&
+          !strcmp(ko->klass.name.data, name);
+}
+
 static jobject
 JNIEnv_NewObjectV(JNIEnv *p0, jclass p1, jmethodID p2, va_list p3)
 {
    assert(p0);
-   return JNIEnv_AllocObject(p0, p1);
-   // FIXME: call constructor
+   jobject o = JNIEnv_AllocObject(p0, p1);
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   if (jvm_class_is(jvm, p1, "java/io/File")) {
+      va_list ap2;
+      va_copy(ap2, p3);
+      jni_file_bind_ctor(p0, o, p2, ap2);
+      va_end(ap2);
+   }
+   return o;
 }
 
 static jobject
@@ -545,8 +562,11 @@ static jobject
 JNIEnv_NewObjectA(JNIEnv* p0, jclass p1, jmethodID p2, jvalue* p3)
 {
    assert(p0);
-   return JNIEnv_AllocObject(p0, p1);
-   // FIXME: call constructor
+   jobject o = JNIEnv_AllocObject(p0, p1);
+   struct jvm *jvm = jnienv_get_jvm(p0);
+   if (jvm_class_is(jvm, p1, "java/io/File"))
+      jni_file_bind_ctor_a(p0, o, p2, p3);
+   return o;
 }
 
 static jclass

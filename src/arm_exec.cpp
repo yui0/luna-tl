@@ -75,8 +75,10 @@ extern "C" {
  * Virtual address layout
  * ---------------------------------------------------------------------- */
 static constexpr uint32_t HEAP_BASE     = 0x50000000u;
-static constexpr uint32_t HEAP_SIZE     = 0xA0000000u; /* 2.5 GB — Unity Dynamic Heap for heavy titles;
- * mmap is relocated below thread stacks (64 MB). */
+/* Was 2.5 GB (to 0xF0000000).  Shrink to 1.25 GB so the secondary mmap arena
+ * can occupy [0xA0000000, 0xF0000000) — primary mmap is only ~0.75 GB after
+ * skipping libraries and munmap is a no-op. */
+static constexpr uint32_t HEAP_SIZE     = 0x50000000u; /* 1.25 GB */
 static constexpr uint32_t THREAD_STACK_BASE = 0x48000000u; /* co-op thread stacks (1MB each) */
 static constexpr uint32_t THREAD_STACK_SIZE = 0x00100000u;
 /* Guest mmap arena.  Unity's TLSF/DynamicHeap reserves *hundreds* of MB of
@@ -94,6 +96,19 @@ static constexpr uint32_t MMAP_END       = 0x41000000u; /* up to the trampoline 
 static constexpr uint32_t MMAP_MAX_SINGLE= 0x10000000u; /* 256 MB cap per single mmap request */
 static constexpr uint32_t MMAP_ALIGN     = 0x10000u;    /* 64 KB alignment (covers HBLKSIZE ≤ 64 KB) */
 static uint32_t g_mmap_next = MMAP_BASE;
+/* Secondary mmap arena: primary [MMAP_BASE,MMAP_END) is only ~500 MB after
+ * skipping libmono/libunity, and munmap is a no-op, so Boehm + Unity Dynamic
+ * Heap exhaust it after long runs → mono setup_stack_trace can't alloc 1 KB
+ * → g_assert abort → PlayerLoop guard chaos.  Uses the upper half of what
+ * used to be the 2.5 GB arm_malloc heap (heap now ends at MMAP2_BASE). */
+static constexpr uint32_t MMAP2_BASE     = 0xA0000000u;
+static constexpr uint32_t MMAP2_END      = 0xF0000000u; /* 1.25 GB */
+static uint32_t g_mmap2_next = 0; /* 0 = not yet activated */
+
+/* Guest library regions, recorded by load_elf. Used by mmap_bump (skip),
+ * /proc/self/maps synth, and RX write guards. ELF p_flags: PF_X=1, PF_W=2, PF_R=4. */
+struct LoadedRegion { uint32_t lo, hi; uint32_t flags; std::string path; };
+static std::vector<LoadedRegion> g_loaded_regions;
 
 /* Mono rejects corlib unless the path sits under .../Managed/mono/2.0/. */
 static void mono_rewrite_corlib_path(std::string &path) {
@@ -106,14 +121,83 @@ static void mono_rewrite_corlib_path(std::string &path) {
 /* Bump-allocate a guest mmap region of `raw_len` bytes (before page-rounding).
  * Returns guest VA on success, or ~0u (MAP_FAILED) on failure.
  * - Caps requests > MMAP_MAX_SINGLE to MAP_FAILED so Boehm GC retries smaller.
- * - Returns 64 KB-aligned addresses so any HBLKSIZE ≤ 64 KB satisfies the GC. */
+ * - Returns 64 KB-aligned addresses so any HBLKSIZE ≤ 64 KB satisfies the GC.
+ * - Skips guest library PT_LOAD ranges: the historical arena [0x10000000,
+ *   0x41000000) overlaps where we now load libmono/libunity (~0x20000000+).
+ *   Without the skip, GC mmap returns a VA inside .text; the subsequent
+ *   zero-fill / use obliterates executable code (seen as word[pc]=0 →
+ *   NoExecuteFault mid-function, with 0x00/0xFF scars in the instruction stream).
+ * - Falls back to MMAP2 when the primary arena is exhausted. */
 static uint32_t mmap_bump(uint32_t raw_len) {
     uint32_t len = (raw_len + 4095u) & ~4095u;
     if (len == 0 || len > MMAP_MAX_SINGLE) return ~0u;
-    if ((uint64_t)g_mmap_next + len > MMAP_END) return ~0u;
-    uint32_t addr = g_mmap_next;
-    g_mmap_next = (uint32_t)(((uint64_t)addr + len + MMAP_ALIGN - 1u) & ~(uint64_t)(MMAP_ALIGN - 1u));
+
+    auto bump_in = [&](uint32_t &next, uint32_t arena_end) -> uint32_t {
+        for (int spins = 0; spins < 64; ++spins) {
+            if ((uint64_t)next + len > arena_end) return ~0u;
+            uint32_t addr = next;
+            uint32_t end  = addr + len;
+            bool hit = false;
+            for (const auto &r : g_loaded_regions) {
+                if (addr < r.hi && end > r.lo) {
+                    uint32_t skip = (r.hi + MMAP_ALIGN - 1u) & ~(MMAP_ALIGN - 1u);
+                    if (skip <= next) return ~0u;
+                    static int logged = 0;
+                    if (logged++ < 8)
+                        fprintf(stderr, "[mmap] skip lib overlap [%08x,%08x) ∩ [%08x,%08x) → next=%08x\n",
+                                addr, end, r.lo, r.hi, skip);
+                    next = skip;
+                    hit = true;
+                    break;
+                }
+            }
+            if (hit) continue;
+            next = (uint32_t)(((uint64_t)end + MMAP_ALIGN - 1u) &
+                              ~(uint64_t)(MMAP_ALIGN - 1u));
+            return addr;
+        }
+        return ~0u;
+    };
+
+    uint32_t addr = bump_in(g_mmap_next, MMAP_END);
+    if (addr != ~0u) return addr;
+
+    if (g_mmap2_next == 0) {
+        g_mmap2_next = MMAP2_BASE;
+        fprintf(stderr, "[mmap] primary arena exhausted (next=%08x); activating "
+                "secondary [%08x,%08x)\n", g_mmap_next, MMAP2_BASE, MMAP2_END);
+    }
+    addr = bump_in(g_mmap2_next, MMAP2_END);
+    if (addr == ~0u) {
+        static int oom = 0;
+        if (oom++ < 8)
+            fprintf(stderr, "[mmap] MAP_FAILED len=%u primary_next=%08x secondary_next=%08x\n",
+                    len, g_mmap_next, g_mmap2_next);
+    }
     return addr;
+}
+
+/* True if [va, va+n) overlaps any loaded RX (PF_X and not PF_W) segment. */
+static bool guest_range_hits_rx(uint32_t va, uint32_t n) {
+    if (!n) return false;
+    uint64_t end = (uint64_t)va + n;
+    if (end > 0x100000000ull) end = 0x100000000ull;
+    for (const auto &r : g_loaded_regions) {
+        if (!(r.flags & 1u) || (r.flags & 2u)) continue; /* need X, not W */
+        if (va < r.hi && end > r.lo) return true;
+    }
+    return false;
+}
+
+/* True if [va, va+n) overlaps any recorded PT_LOAD (code or data). */
+static bool guest_range_hits_loaded(uint32_t va, uint32_t n) {
+    if (!n) return false;
+    uint64_t end = (uint64_t)va + n;
+    if (end > 0x100000000ull) end = 0x100000000ull;
+    for (const auto &r : g_loaded_regions) {
+        if (va < r.hi && end > r.lo) return true;
+    }
+    return false;
 }
 /* sbrk / brk arena for Boehm GC's GC_scratch_alloc().
  * Must sit in the gap between libunity.so (ends ~0x00BA0840) and
@@ -141,6 +225,9 @@ static constexpr uint32_t MJIV_CACHE      = LIBC_DATA + 0x20u; /* cached mono do
 static constexpr uint32_t MJIV_ENTRY_MARK = LIBC_DATA + 0x24u; /* diag: stub entry count */
 static constexpr uint32_t MJIV_RUNTIME_VER = LIBC_DATA + 0x28u; /* jit init version string */
 static constexpr uint32_t MONO_EMPTY_STR     = LIBC_DATA + 0x2cu; /* "" for g_build_filename guard */
+static constexpr uint32_t LIBC_CTYPE_TAB     = LIBC_DATA + 0x300u; /* bionic _ctype_[257] */
+static constexpr uint32_t LIBC_TOLOWER_TAB   = LIBC_DATA + 0x400u; /* bionic _tolower_tab_[257] */
+static uint32_t g_reloc_data_start = 0; /* per-library .data start for data_start/__data_start */
 
 /* tiny ARM stub that does nothing and returns r0=0.
  * Used as replacement target when blx r12 would call a heap/null address.
@@ -372,6 +459,7 @@ static constexpr uint32_t SVC_GL_VertexAttrib1fv       = 404u;
 static constexpr uint32_t SVC_GL_VertexAttrib2fv       = 405u;
 static constexpr uint32_t SVC_GL_VertexAttrib3fv       = 406u;
 
+static constexpr uint32_t SVC_GL_GetTexParameteriv    = 541u;
 
 static constexpr uint32_t SVC_AEABI_UIDIV       = 407u;
 static constexpr uint32_t SVC_AEABI_UIDIVMOD    = 408u;
@@ -772,7 +860,16 @@ static constexpr uint32_t SVC_ACHOREOGRAPHER_POST      = SVC29_BASE + 26u; /* po
 static constexpr uint32_t SVC_ACHOREOGRAPHER_POST64    = SVC29_BASE + 27u; /* postFrameCallback64 */
 static constexpr uint32_t SVC_ACHOREOGRAPHER_POSTDELAY = SVC29_BASE + 28u; /* postFrameCallbackDelayed */
 static constexpr uint32_t SVC_MONO_PREP            = SVC29_BASE + 29u; /* mono config before jit init */
-static constexpr uint32_t SVC29_TOTAL            = SVC29_BASE + 30u;
+static constexpr uint32_t SVC_ANW_LOCK             = SVC29_BASE + 30u;
+static constexpr uint32_t SVC_ANW_UNLOCK           = SVC29_BASE + 31u;
+static constexpr uint32_t SVC_AEABI_IDIV0          = SVC29_BASE + 32u;
+static constexpr uint32_t SVC_AEABI_LDIV0          = SVC29_BASE + 33u;
+static constexpr uint32_t SVC_AEABI_LLSL           = SVC29_BASE + 34u;
+static constexpr uint32_t SVC_AEABI_LLSR           = SVC29_BASE + 35u;
+static constexpr uint32_t SVC_ISFINITEF            = SVC29_BASE + 36u;
+static constexpr uint32_t SVC_WPRINTF              = SVC29_BASE + 37u;
+static constexpr uint32_t SVC_SWSCANF              = SVC29_BASE + 38u;
+static constexpr uint32_t SVC29_TOTAL            = SVC29_BASE + 39u;
 
 /* ---- GC signal / sigaction ---- */
 static constexpr uint32_t SVC31_BASE             = SVC29_TOTAL;
@@ -855,7 +952,28 @@ static constexpr uint32_t SVC_GL3_DrawElementsBaseVertex = SVC31_BASE + 53u;
  * emits this SVC before entering the real libc++abi __cxa_throw. */
 static constexpr uint32_t SVC_EXC_CXA_THROW              = SVC31_BASE + 54u;
 
-static constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_EXC_CXA_THROW + 1u;
+/* GL extension entry points the host may or may not back.  A real Android
+ * EGL never returns NULL from eglGetProcAddress for these when the matching
+ * extension is advertised — Unity 5.x stores the pointer unchecked and calls
+ * it (e.g. glObjectLabelKHR right after texture setup ⇒ pc=0 fault).  Each
+ * handler forwards to the host function when one exists and degrades to a
+ * safe no-op otherwise.  glDebugMessageCallback never forwards: the guest
+ * callback pointer must not reach the host GL. */
+static constexpr uint32_t SVC_GLX_DebugMessageControl    = SVC31_BASE + 55u;
+static constexpr uint32_t SVC_GLX_DebugMessageCallback   = SVC31_BASE + 56u;
+static constexpr uint32_t SVC_GLX_DebugMessageInsert     = SVC31_BASE + 57u;
+static constexpr uint32_t SVC_GLX_ObjectLabel            = SVC31_BASE + 58u;
+static constexpr uint32_t SVC_GLX_GetObjectLabel         = SVC31_BASE + 59u;
+static constexpr uint32_t SVC_GLX_PushDebugGroup         = SVC31_BASE + 60u;
+static constexpr uint32_t SVC_GLX_PopDebugGroup          = SVC31_BASE + 61u;
+static constexpr uint32_t SVC_GLX_MarkerNop              = SVC31_BASE + 62u; /* EXT_debug_marker/label */
+static constexpr uint32_t SVC_GLX_BufferStorage          = SVC31_BASE + 63u;
+static constexpr uint32_t SVC_GLX_QueryCounter           = SVC31_BASE + 64u;
+static constexpr uint32_t SVC_GLX_GetQueryObjectui64v    = SVC31_BASE + 65u;
+static constexpr uint32_t SVC_GLX_DrawElemInstBaseVertex = SVC31_BASE + 66u;
+static constexpr uint32_t SVC_GLX_BlendBarrier           = SVC31_BASE + 67u;
+
+static constexpr uint32_t SVC_TRAMP_TOTAL        = SVC_GLX_BlendBarrier + 1u;
 
 static constexpr uint32_t TRAMP_STRIDE     = 8u; /* ARM32: SVC #n + BX LR */
 
@@ -934,6 +1052,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"ANativeWindow_getHeight",          SVC_ANW_GETHEIGHT},
     {"ANativeWindow_setBuffersGeometry", SVC_ANW_SETBUFGEO},
     {"ANativeWindow_toSurface",          SVC_ANW_TOSURFACE},
+    {"ANativeWindow_lock",               SVC_ANW_LOCK},
+    {"ANativeWindow_unlockAndPost",      SVC_ANW_UNLOCK},
     
     {"eglGetDisplay",         SVC_EGL_GETDISPLAY},
     {"eglInitialize",         SVC_EGL_INITIALIZE},
@@ -967,6 +1087,10 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"__aeabi_idivmod",       SVC_AEABI_IDIV}, /* shared with SVC_AEABI_IDIV handler (sets quotient r0 and remainder r1) */
     {"__aeabi_ldivmod",       SVC_AEABI_LDIVMOD},
     {"__aeabi_uldivmod",      SVC_AEABI_ULDIVMOD},
+    {"__aeabi_idiv0",         SVC_AEABI_IDIV0},
+    {"__aeabi_ldiv0",         SVC_AEABI_LDIV0},
+    {"__aeabi_llsl",          SVC_AEABI_LLSL},
+    {"__aeabi_llsr",          SVC_AEABI_LLSR},
     
     {"open",                  SVC_LIBC_OPEN},
     {"open64",                SVC_LIBC_OPEN},
@@ -1027,6 +1151,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glActiveTexture",         SVC_GL_ActiveTexture},
     {"glDeleteTextures",        SVC_GL_DeleteTextures},
     {"glTexParameteri",         SVC_GL_TexParameteri},
+    {"glGetTexParameteriv",     SVC_GL_GetTexParameteriv},
     {"glTexImage2D",            SVC_GL_TexImage2D},
     {"glTexSubImage2D",         SVC_GL_TexSubImage2D},
     {"glCopyTexSubImage2D",     SVC_GL_CopyTexSubImage2D},
@@ -1153,6 +1278,49 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"glDetachShader",           SVC_GL3_DetachShader},
     {"glDrawBuffers",            SVC_GL3_DrawBuffers},
     {"glDrawElementsBaseVertex", SVC_GL3_DrawElementsBaseVertex},
+
+    /* GL_KHR_debug (+core/ARB aliases) */
+    {"glDebugMessageControl",    SVC_GLX_DebugMessageControl},
+    {"glDebugMessageControlKHR", SVC_GLX_DebugMessageControl},
+    {"glDebugMessageControlARB", SVC_GLX_DebugMessageControl},
+    {"glDebugMessageCallback",   SVC_GLX_DebugMessageCallback},
+    {"glDebugMessageCallbackKHR",SVC_GLX_DebugMessageCallback},
+    {"glDebugMessageCallbackARB",SVC_GLX_DebugMessageCallback},
+    {"glDebugMessageInsert",     SVC_GLX_DebugMessageInsert},
+    {"glDebugMessageInsertKHR",  SVC_GLX_DebugMessageInsert},
+    {"glDebugMessageInsertARB",  SVC_GLX_DebugMessageInsert},
+    {"glObjectLabel",            SVC_GLX_ObjectLabel},
+    {"glObjectLabelKHR",         SVC_GLX_ObjectLabel},
+    {"glGetObjectLabel",         SVC_GLX_GetObjectLabel},
+    {"glGetObjectLabelKHR",      SVC_GLX_GetObjectLabel},
+    {"glPushDebugGroup",         SVC_GLX_PushDebugGroup},
+    {"glPushDebugGroupKHR",      SVC_GLX_PushDebugGroup},
+    {"glPopDebugGroup",          SVC_GLX_PopDebugGroup},
+    {"glPopDebugGroupKHR",       SVC_GLX_PopDebugGroup},
+    /* GL_EXT_debug_marker / GL_EXT_debug_label (annotation only → no-op) */
+    {"glPushGroupMarkerEXT",     SVC_GLX_MarkerNop},
+    {"glPopGroupMarkerEXT",      SVC_GLX_MarkerNop},
+    {"glInsertEventMarkerEXT",   SVC_GLX_MarkerNop},
+    {"glLabelObjectEXT",         SVC_GLX_MarkerNop},
+    {"glGetObjectLabelEXT",      SVC_GLX_GetObjectLabel},
+    /* GL_EXT_buffer_storage */
+    {"glBufferStorage",          SVC_GLX_BufferStorage},
+    {"glBufferStorageEXT",       SVC_GLX_BufferStorage},
+    /* GL_EXT_disjoint_timer_query / NV variants */
+    {"glQueryCounterEXT",        SVC_GLX_QueryCounter},
+    {"glQueryCounterNV",         SVC_GLX_QueryCounter},
+    {"glGetQueryObjectui64vEXT", SVC_GLX_GetQueryObjectui64v},
+    {"glGetQueryObjectui64vNV",  SVC_GLX_GetQueryObjectui64v},
+    /* base-vertex draw variants */
+    {"glDrawElementsBaseVertexEXT", SVC_GL3_DrawElementsBaseVertex},
+    {"glDrawElementsBaseVertexOES", SVC_GL3_DrawElementsBaseVertex},
+    {"glDrawElementsInstancedBaseVertex",    SVC_GLX_DrawElemInstBaseVertex},
+    {"glDrawElementsInstancedBaseVertexEXT", SVC_GLX_DrawElemInstBaseVertex},
+    {"glDrawElementsInstancedBaseVertexOES", SVC_GLX_DrawElemInstBaseVertex},
+    /* GL_KHR_blend_equation_advanced */
+    {"glBlendBarrier",           SVC_GLX_BlendBarrier},
+    {"glBlendBarrierKHR",        SVC_GLX_BlendBarrier},
+    {"glBlendBarrierNV",         SVC_GLX_BlendBarrier},
 
     {"clock_gettime",           SVC_CLOCK_GETTIME},
     {"gettimeofday",            SVC_GETTIMEOFDAY},
@@ -1391,6 +1559,14 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"getuid",                  SVC_RET0},
     {"geteuid",                 SVC_RET0},
     {"getegid",                 SVC_RET0},
+    {"getgid",                  SVC_RET0},
+    {"setuid",                  SVC_RET0},
+    {"seteuid",                 SVC_RET0},
+    {"setgid",                  SVC_RET0},
+    {"setegid",                 SVC_RET0},
+    {"setreuid",                SVC_RET0},
+    {"setregid",                SVC_RET0},
+    {"sync",                    SVC_RET0},
     {"raise",                   SVC_RET0},
     {"kill",                    SVC_PTHREAD_KILL},
     {"bsd_signal",              SVC_BSD_SIGNAL},
@@ -1480,6 +1656,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"isfinite",                SVC_ISFINITE},
     {"__isfinite",              SVC_ISFINITE},
     {"isfinitef",               SVC_ISFINITE},
+    {"__isfinitef",             SVC_ISFINITEF},
     {"finite",                  SVC_ISFINITE},  /* deprecated BSD alias */
     {"finitef",                 SVC_ISFINITE},
     {"signbit",                 SVC_SIGNBIT},
@@ -1551,6 +1728,9 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"pipe2",                   SVC_PIPE2},
     {"epoll_create",            SVC_RETM1},
     {"inotify_init",            SVC_RETM1},
+    {"inotify_init1",           SVC_RETM1},
+    {"inotify_add_watch",       SVC_RETM1},
+    {"inotify_rm_watch",        SVC_RETM1},
     {"mkstemp",                 SVC_RETM1},
     {"mkstemps",                SVC_RETM1},
     {"mkdtemp",                 SVC_RETM1},
@@ -1565,6 +1745,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"__stack_chk_guard",       SVC_RET0},
     
     {"_Unwind_Complete",             SVC_RET0},
+    {"_Unwind_Backtrace",            SVC_RET0},
     {"_Unwind_DeleteException",      SVC_RET0},
     {"_Unwind_GetDataRelBase",       SVC_RET0},
     {"_Unwind_GetLanguageSpecificData", SVC_RET0},
@@ -1576,6 +1757,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"_Unwind_VRS_Get",              SVC_RET0},
     {"_Unwind_VRS_Set",              SVC_RET0},
     {"__gnu_unwind_frame",           SVC_RET0},
+    {"__google_potentially_blocking_region_begin", SVC_RET0},
+    {"__google_potentially_blocking_region_end",   SVC_RET0},
     {"__cxa_begin_cleanup",          SVC_RET0},
     {"__cxa_call_unexpected",        SVC_RET0},
     {"__cxa_type_match",             SVC_RET0},
@@ -1621,6 +1804,7 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     {"ASensorManager_getSensorList",    SVC_RET0},
     
     {"_Z28ANativeActivity_feedWatchdogd",  SVC_RET0},
+    {"_Z28ANativeActivity_feedWatchdogv",  SVC_RET0},
     {"_Z29ANativeActivity_getInputQueuev", SVC_RET0},
     {"_Z30ANativeActivity_enableWatchdogb",SVC_RET0},
     {"_Z42ANativeActivity_forwardMotionEventToDalvikP11AInputEventP7_JNIEnv", SVC_RET0},
@@ -1826,6 +2010,8 @@ static const std::pair<const char *, uint32_t> kSymbolSvcMap[] = {
     
     {"wmemcmp",                   SVC_WMEMCMP},
     {"swprintf",                  SVC_SWPRINTF},
+    {"wprintf",                   SVC_WPRINTF},
+    {"swscanf",                   SVC_SWSCANF},
     
     {"localeconv",                SVC_LOCALECONV},
     
@@ -1952,6 +2138,10 @@ static uint32_t lookup_symbol_direct_va(const char *name) {
     if (strcmp(name, "__page_size")  == 0) return LIBC_PAGE_SIZE;
     if (strcmp(name, "__page_shift") == 0) return LIBC_PAGE_SHIFT;
     if (strcmp(name, "__page_mask")  == 0) return LIBC_PAGE_MASK;
+    if (strcmp(name, "_ctype_")     == 0) return LIBC_CTYPE_TAB;
+    if (strcmp(name, "_tolower_tab_")== 0) return LIBC_TOLOWER_TAB;
+    if (strcmp(name, "__data_start") == 0 || strcmp(name, "data_start") == 0)
+        return g_reloc_data_start ? g_reloc_data_start : LIBC_DATA;
     
     /* AMEDIAFORMAT_KEY_* are const char* data symbols; *ptr==0 yields empty string */
     if (strncmp(name, "AMEDIAFORMAT_KEY_", 17) == 0) return NOOP_RET0;
@@ -2008,8 +2198,9 @@ public:
         (void)base; (void)size;
     }
     uint8_t *ptr(uint32_t va) { return host + va; }
+    const uint8_t *ptr(uint32_t va) const { return host + va; }
     void write32(uint32_t va, uint32_t v);
-    uint32_t read32(uint32_t va) {
+    uint32_t read32(uint32_t va) const {
         uint32_t v; std::memcpy(&v, host + va, 4); return v; }
     const char *cstr(uint32_t va) {
         if (!va) return nullptr;
@@ -2082,11 +2273,31 @@ static uint32_t arm_malloc(ArmExecCtx &ctx, uint32_t size) {
     size = arm_align8(size);
     ++g_malloc_calls;
 
-    /* best-fit reuse from the free list */
-    auto it = g_free_list.lower_bound(size);
-    if (it != g_free_list.end()) {
+    /* best-fit reuse from the free list.  A free-list entry is only safe to
+     * hand out if its in-memory header still reads back as FREE_MAGIC with the
+     * recorded size: otherwise the block was overwritten while "free" (e.g. the
+     * guest kept writing through a dangling pointer, or a prior split placed a
+     * remainder header inside a region another allocation later reused) and
+     * reusing it would produce two live allocations that overlap — exactly the
+     * corruption seen as FREE_MAGIC/ALLOC_MAGIC words appearing inside live
+     * Unity objects.  Skip and discard any entry that fails validation so the
+     * heap stays consistent instead of returning aliased memory. */
+    for (auto it = g_free_list.lower_bound(size); it != g_free_list.end(); ) {
         uint32_t blk = it->first;   /* payload size of the free block */
         uint32_t va  = it->second;  /* payload VA */
+        if (va < HEAP_BASE + HEAP_HDR || va >= ctx.heap_ptr ||
+            ctx.mem.read32(va - 4) != FREE_MAGIC ||
+            ctx.mem.read32(va - HEAP_HDR) != blk) {
+            static uint64_t g_stale = 0;
+            if (getenv("LUNARIA_TRACE_HEAP") && g_stale < 40)
+                fprintf(stderr, "[heap] dropping stale free-list entry va=0x%08x "
+                        "blk=%u hdr_sz=0x%08x hdr_magic=0x%08x\n",
+                        va, blk, va >= HEAP_BASE + HEAP_HDR ? ctx.mem.read32(va - HEAP_HDR) : 0,
+                        va >= HEAP_BASE + HEAP_HDR ? ctx.mem.read32(va - 4) : 0);
+            ++g_stale;
+            it = g_free_list.erase(it);   /* corrupt entry: never hand it out */
+            continue;
+        }
         g_free_list.erase(it);
         ++g_malloc_reused;
         /* split if the leftover can hold a header + a minimal (8B) payload */
@@ -2100,8 +2311,6 @@ static uint32_t arm_malloc(ArmExecCtx &ctx, uint32_t size) {
             ctx.mem.write32(va - HEAP_HDR, size); /* shrink this block */
         }
         ctx.mem.write32(va - 4, ALLOC_MAGIC);
-        /* Zero reused block: g_malloc0 calls malloc expecting zeroed memory */
-        memset(ctx.mem.ptr(va), 0, size);
         return va;
     }
 
@@ -2125,6 +2334,10 @@ static uint32_t arm_malloc(ArmExecCtx &ctx, uint32_t size) {
     ctx.mem.write32(hdr,     size);
     ctx.mem.write32(hdr + 4, ALLOC_MAGIC);
     ctx.heap_ptr = va + size;
+    /* mmap arena is zero-filled; real malloc leaves payload undefined.  Unity 4
+     * splash loader (+0x8400c) treats [obj+0x128] >= 0 as "skip load", so fresh
+     * zeroed fields bypass image init and texture upload faults on unset +0x184. */
+    memset(ctx.mem.ptr(va), 0xFF, size);
     return va;
 }
 
@@ -2181,12 +2394,35 @@ static ArmExecCtx *g_ctx = nullptr;
  * (single-instruction blocks update R[15] per instruction). */
 static uint32_t g_watch_lo = 0;
 static uint32_t g_watch_hi = 0;
+/* LUNARIA_WWATCH=hexaddr — log every store that overlaps this word address,
+ * with the writing block's PC, so the exact initializer of a runtime field can
+ * be identified even when many structs share the same struct-relative offset.
+ * Forces fastmem off (below) so every store routes through MemoryWrite*. */
+static uint32_t g_wwatch_addr = 0;
 /* LUNARIA_TRACE_XCL=lo:hi — log every exclusive (strex) write into [lo,hi) */
 static uint32_t g_xcl_lo = 0;
 static uint32_t g_xcl_hi = 0;
 static bool     g_step_mode = false;     /* drive execution one instruction at a time */
 static bool     g_step_capture_done = false;
 static uint32_t g_watch_poll_addr = 0;   /* word polled between single-steps */
+/* LUNARIA_STEP_TRACE=hexva: once pc reaches this VA, single-step and log every
+ * instruction PC until pc falls below 0x1000 (jump-to-null) or a step cap. */
+static uint32_t g_steptrace_trigger = 0;
+static bool     g_steptrace_armed = false;
+/* LUNARIA_STEP_ON_VAL=hexval: arm the step-to-null tracer when any 32-bit store
+ * writes this value (reliable, unlike AddTicks-PC triggers). */
+static uint32_t g_step_on_val = 0;
+static bool     g_step_on_val_set = false;
+/* LUNARIA_STEP_ON_ADDR=hexaddr: when set, STEP_ON_VAL arms only if the store
+ * target address also matches (pins one specific stack slot, avoiding early
+ * hits of a value that recurs across the run). */
+static uint32_t g_step_on_addr = 0;
+static bool     g_step_on_addr_set = false;
+/* LUNARIA_STEP_AFTER_TICKS: only arm STEP_ON_VAL after this many global ticks. */
+static uint64_t g_step_after_ticks = 0;
+static uint64_t g_global_ticks = 0;   /* updated from run loop / AddTicks */
+static uint64_t g_step_after_mark = 0; /* LUNARIA_STEP_AFTER: halt Run() once crossed */
+static bool     g_stepa_requested = false;
 
 /* Host FILE* table for ARM fopen/fclose/fread/fwrite/fseek/ftell.
  * SVC fopen() does not hand the guest a raw table index; it returns a pointer
@@ -2233,13 +2469,6 @@ static uint32_t register_file(ArmExecCtx &ctx, FILE *f) {
     }
     return idx; /* arm_malloc failed: bare index fallback */
 }
-
-/* Guest library regions, recorded by load_elf, used to synthesize a guest-side
- * /proc/self/maps (see synthetic_proc_path).  Each entry is one PT_LOAD segment
- * with its actual ELF permissions (PF_R/W/X → r/w/x in maps notation). */
-struct LoadedRegion { uint32_t lo, hi; uint32_t flags; std::string path; };
-/* ELF p_flags: PF_X=1, PF_W=2, PF_R=4 */
-static std::vector<LoadedRegion> g_loaded_regions;
 
 /* Per-module .ARM.exidx tables (PT_ARM_EXIDX), recorded by load_elf.
  * dl_unwind_find_exidx must return the real table: libc++abi's unwinder
@@ -2411,7 +2640,8 @@ static void wrange_log(uint32_t va, uint32_t val, uint32_t bytes,
                        uint32_t pc, uint32_t lr, const char *src) {
     if (g_wrange_hi == 0 || va >= g_wrange_hi || va + bytes <= g_wrange_lo) return;
     static int n = 0;
-    if (n++ < 60)
+    static const int cap = getenv("LUNARIA_WRANGE_CAP") ? atoi(getenv("LUNARIA_WRANGE_CAP")) : 60;
+    if (n++ < cap)
         fprintf(stderr, "[wrange] %s va=0x%08x val=0x%08x bytes=%u pc~0x%08x "
                 "lr=0x%08x tid=%u\n", src, va, val, bytes, pc, lr, g_current_tid);
 }
@@ -2505,6 +2735,7 @@ static uint32_t errno_va(ArmExecCtx &ctx, uint32_t tid) {
 }
 /* true when guest thread is blocked — CallSVC yields the slice */
 static bool g_yield_requested = false;
+static uint64_t g_guest_abort_count = 0;
 /* ALooper_wake() sets this; ALooper_pollOnce spin loop checks it */
 static std::atomic<bool> g_alooper_wake_pending{false};
 static bool g_in_cb = false;  /* true while call_guest_cb is executing */
@@ -2541,7 +2772,98 @@ static EGLConfig resolve_egl_config(uint32_t handle) {
 }
 static uint32_t g_fake_anw_va = 0; /* guest ANativeWindow { ops*, ... } */
 static uint32_t g_mono_base   = 0; /* libmono.so load base (set in load_elf) */
+static uint32_t g_mono_hi     = 0; /* libmono.so PT_LOAD high VA (exclusive) */
+static uint32_t g_unity_base  = 0; /* libunity.so load base (set in load_elf) */
 static std::string g_unity_machine_config; /* embedded in libunity.so rodata */
+
+static bool unity_guest_ptr(uint32_t va) {
+    return va >= 0x1000u && va < 0xf0000000u;
+}
+
+static bool unity_code_ptr(uint32_t va) {
+    return g_unity_base && va >= g_unity_base && va < g_unity_base + 0x1000000u;
+}
+
+static bool unity_callback_ptr(uint32_t va) {
+    if (va < 0x1000u || va == 0xffffffffu) return false;
+    if (va >= 0x41000000u && va < 0x42000000u) return true;
+    return g_unity_base && va >= g_unity_base && va < g_unity_base + 0x00e80000u;
+}
+
+/* GfxDevice format registry used by libunity+0x4a4fe0 upload dispatch. */
+static uint32_t unity_read_fmt_registry(ArmExecCtx &ctx) {
+    if (!g_unity_base) return 0;
+    static const uint32_t got_slots[] = { 0xeb6184u, 0xeb61e0u, 0xa456e0u };
+    for (uint32_t off : got_slots) {
+        uint32_t slot = g_unity_base + off;
+        if (!ctx.mem.ptr(slot)) continue;
+        uint32_t p = ctx.mem.read32(slot);
+        if (!unity_guest_ptr(p) || !ctx.mem.ptr(p)) continue;
+        uint32_t reg = ctx.mem.read32(p);
+        if (!unity_guest_ptr(reg) || !ctx.mem.ptr(reg + 0x28u)) continue;
+        uint32_t tbl = ctx.mem.read32(reg + 0x1cu);
+        if (!unity_guest_ptr(tbl) || !ctx.mem.ptr(tbl)) continue;
+        return reg;
+    }
+    return 0;
+}
+
+static uint32_t unity_lookup_format_desc(ArmExecCtx &ctx, uint32_t reg, uint32_t idx) {
+    if (!reg || !ctx.mem.ptr(reg + 0x24u)) return 0;
+    uint32_t tbl = ctx.mem.read32(reg + 0x1cu);
+    if (!unity_guest_ptr(tbl) || !ctx.mem.ptr(tbl + idx * 8u + 4u)) return 0;
+    uint32_t ent = ctx.mem.read32(tbl + idx * 8u + 4u);
+    if (!unity_guest_ptr(ent) || !ctx.mem.ptr(ent)) return 0;
+    uint32_t desc = ctx.mem.read32(ent);
+    if (!unity_guest_ptr(desc) || !ctx.mem.ptr(desc + 0x188u)) return 0;
+    uint32_t cb = ctx.mem.read32(desc + 0x184u);
+    if (!unity_callback_ptr(cb)) return 0;
+    return desc;
+}
+
+/* Fallback: scan the GfxDevice format table blob initialized by +0x4b0a8. */
+static uint32_t unity_scan_format_desc(ArmExecCtx &ctx, uint32_t want_fmt) {
+    if (!g_unity_base) return 0;
+    static const uint32_t bases[] = { 0xec7ad0u, 0xec6ad0u, 0xec8ad0u };
+    static const unsigned strides[] = { 0x2b8u, 0x298u, 0x2c0u, 0x300u };
+    for (uint32_t boff : bases) {
+        uint32_t base = g_unity_base + boff;
+        for (unsigned stride : strides) {
+            for (unsigned i = 0; i < 96; ++i) {
+                uint32_t e = base + i * stride;
+                if (!ctx.mem.ptr(e + 0x188u)) break;
+                uint32_t id = ctx.mem.read32(e + 0x10u);
+                if (want_fmt && id != want_fmt) continue;
+                uint32_t cb = ctx.mem.read32(e + 0x184u);
+                if (unity_callback_ptr(cb)) return e;
+            }
+        }
+    }
+    return 0;
+}
+
+static uint32_t unity_probe_fmt_registry(ArmExecCtx &ctx) {
+    uint32_t reg = unity_read_fmt_registry(ctx);
+    if (reg) return reg;
+    if (!g_unity_base) return 0;
+    for (uint32_t off = 0xeb6000u; off < 0xeb6800u; off += 4u) {
+        uint32_t slot = g_unity_base + off;
+        if (!ctx.mem.ptr(slot)) continue;
+        uint32_t p = ctx.mem.read32(slot);
+        if (!unity_guest_ptr(p) || !ctx.mem.ptr(p)) continue;
+        uint32_t cand = ctx.mem.read32(p);
+        if (!unity_guest_ptr(cand) || !ctx.mem.ptr(cand + 0x28u)) continue;
+        uint32_t tbl = ctx.mem.read32(cand + 0x1cu);
+        if (!unity_guest_ptr(tbl) || !ctx.mem.ptr(tbl)) continue;
+        return cand;
+    }
+    return 0;
+}
+
+struct ArmExecCtx;
+static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
+                   uint32_t r0, uint32_t r1, uint32_t r2, uint32_t r3,
+                   uint64_t tick_budget);
 
 static const char *memmem_buf(const void *hay, size_t hlen, const char *needle) {
     if (!hay || !needle) return nullptr;
@@ -2572,6 +2894,120 @@ static uint32_t mono_fn_va(const char *sym, uint32_t legacy_off = 0) {
     return (legacy_off && g_mono_base) ? g_mono_base + legacy_off : 0u;
 }
 
+/* --- libmono internal discovery (no build-specific file offsets) ------------ */
+
+static bool arm_is_ldr_pc_u32(uint32_t w) {
+    return (w & 0x0f7f0000u) == 0x051f0000u; /* ldr Rt, [pc, #imm] */
+}
+
+static bool arm_is_add_pc_reg(uint32_t w) {
+    return (w & 0xffe00000u) == 0xe0800000u
+        && ((w >> 16) & 0xfu) == 0xfu          /* Rn = PC */
+        && ((w >> 12) & 0xfu) == (w & 0xfu);  /* Rd = Rm (global slot ptr) */
+}
+
+static uint32_t arm_bl_dest(uint32_t bl_va, uint32_t w) {
+    if ((w & 0xff000000u) != 0xeb000000u) return 0;
+    int32_t imm = (int32_t)(w & 0xffffffu);
+    if (imm & 0x800000) imm -= 0x1000000;
+    return bl_va + 8u + (uint32_t)(imm * 4);
+}
+
+/* Nth "ldr rX,[pc,#imm]; add rX,pc,rX" PIC slot in a function (address of the global). */
+static uint32_t mono_arm_pic_global(const ArmExecCtx &ctx, uint32_t fn_va, unsigned nth) {
+    fn_va &= ~1u;
+    unsigned found = 0;
+    for (uint32_t va = fn_va; va < fn_va + 0x500u; va += 4u) {
+        uint32_t w = ctx.mem.read32(va);
+        if (!arm_is_ldr_pc_u32(w)) continue;
+        uint32_t w2 = ctx.mem.read32(va + 4);
+        if (!arm_is_add_pc_reg(w2)) continue;
+        uint32_t lit = va + 8u + (w & 0xfffu);
+        if (!ctx.mem.ptr(lit)) continue;
+        int32_t rel = (int32_t)ctx.mem.read32(lit);
+        uint32_t slot = va + 4u + 8u + (uint32_t)rel;
+        if (found++ == nth) return slot;
+    }
+    return 0;
+}
+
+static uint32_t mono_arm_pic_global_at(const ArmExecCtx &ctx, uint32_t ldr_va) {
+    ldr_va &= ~1u;
+    uint32_t w = ctx.mem.read32(ldr_va);
+    if (!arm_is_ldr_pc_u32(w)) return 0;
+    uint32_t w2 = ctx.mem.read32(ldr_va + 4);
+    if (!arm_is_add_pc_reg(w2)) return 0;
+    uint32_t lit = ldr_va + 8u + (w & 0xfffu);
+    if (!ctx.mem.ptr(lit)) return 0;
+    int32_t rel = (int32_t)ctx.mem.read32(lit);
+    return ldr_va + 4u + 8u + (uint32_t)rel;
+}
+
+static uint32_t mono_fn_start(const ArmExecCtx &ctx, uint32_t va) {
+    va &= ~3u;
+    for (uint32_t a = va; a > va - 0x10000u && a >= g_mono_base; a -= 4u) {
+        if ((ctx.mem.read32(a) & 0xffff0000u) == 0xe92d0000u) return a;
+    }
+    return 0;
+}
+
+/* GOT anchor: ldr r4,[pc,#imm]; add r4, pc, r4 at function entry. */
+static uint32_t mono_fn_got_r4(const ArmExecCtx &ctx, uint32_t fn) {
+    fn &= ~1u;
+    for (uint32_t va = fn; va < fn + 0x40u; va += 4u) {
+        uint32_t w = ctx.mem.read32(va);
+        if (!arm_is_ldr_pc_u32(w) || ((w >> 12) & 0xfu) != 4u) continue;
+        uint32_t w2 = ctx.mem.read32(va + 4);
+        if ((w2 & 0xffe00000u) != 0xe0800000u) continue;
+        if (((w2 >> 16) & 0xfu) != 0xfu || (w2 & 0xfu) != 4u) continue;
+        uint32_t lit = va + 8u + (w & 0xfffu);
+        int32_t rel = (int32_t)ctx.mem.read32(lit);
+        return va + 8u + (uint32_t)rel;
+    }
+    return 0;
+}
+
+static uint32_t mono_find_str_to_slot(const ArmExecCtx &ctx, uint32_t slot) {
+    if (!g_mono_base || g_mono_hi <= g_mono_base) return 0;
+    for (uint32_t va = g_mono_base; va + 8u < g_mono_hi; va += 4u) {
+        if ((ctx.mem.read32(va) & 0xffe00000u) != 0xe5800000u) continue;
+        if (mono_arm_pic_global_at(ctx, va - 8u) == slot) return va;
+    }
+    return 0;
+}
+
+static uint32_t mono_bl_before(const ArmExecCtx &ctx, uint32_t end_va, uint32_t limit = 0x28u) {
+    end_va &= ~1u;
+    for (uint32_t va = (end_va > limit ? end_va - limit : g_mono_base); va < end_va; va += 4u) {
+        if (arm_bl_dest(va, ctx.mem.read32(va))) return va;
+    }
+    return 0;
+}
+
+/* Three "ldr r3,[pc]; ldr r3,[r4,r3]" GOT loads before g_hash_table_new wrapper bl. */
+static bool mono_read_got_triple_before_bl(const ArmExecCtx &ctx, uint32_t bl_va,
+                                           uint32_t got_r4, uint32_t &hash_fn,
+                                           uint32_t &eq_fn, uint32_t &extra) {
+    bl_va &= ~1u;
+    uint32_t vals[3] = {};
+    unsigned n = 0;
+    for (uint32_t va = (bl_va > 0x30u ? bl_va - 0x30u : g_mono_base); va < bl_va && n < 3; va += 4u) {
+        uint32_t w = ctx.mem.read32(va);
+        if (!arm_is_ldr_pc_u32(w) || ((w >> 12) & 0xfu) != 3u) continue;
+        uint32_t w2 = ctx.mem.read32(va + 4);
+        if (w2 != 0xe7943003u) continue; /* ldr r3, [r4, r3] */
+        uint32_t lit = va + 8u + (w & 0xfffu);
+        int32_t off = (int32_t)ctx.mem.read32(lit);
+        vals[n++] = ctx.mem.read32(got_r4 + (uint32_t)off);
+        va += 4u;
+    }
+    if (n < 3 || !vals[1] || !vals[2]) return false;
+    hash_fn = vals[0];
+    eq_fn = vals[1];
+    extra = vals[2];
+    return true;
+}
+
 static void ensure_mono_domain_slot(ArmExecCtx &ctx) {
     if (!g_mono_base) return;
     const uint32_t slot = g_mono_base + 0x3bd918u;
@@ -2585,6 +3021,7 @@ static constexpr uint32_t ARM_ALOOPER     = 6u; /* non-NULL sentinel for ALooper
 static constexpr uint32_t ARM_LIBANDROID  = 0xAB10D000u; /* fake dlopen handle for libandroid.so */
 static constexpr uint32_t ARM_LIBAAUDIO   = 0xAB10D100u; /* fake dlopen handle for libaaudio.so */
 static constexpr uint32_t ARM_LIBC        = 0xAB10D200u; /* fake dlopen handle for libc.so */
+static constexpr uint32_t ARM_LIBOPENSLES = 0xAB10D300u; /* fake dlopen handle for libOpenSLES.so */
 static constexpr uint32_t ARM_AAUDIO_BUILDER = 0xAB10D110u; /* opaque AAudioStreamBuilder* */
 static constexpr uint32_t ARM_AAUDIO_STREAM  = 0xAB10D120u; /* opaque AAudioStream* (16B stride) */
 static constexpr uint32_t ARM_ACHOREOGRAPHER = 0xC0FEBEEFu;
@@ -2699,8 +3136,13 @@ static void arm_exec_run_runnable(uint32_t runnable_h)
     auto pit = g_jproxy_ptrs.find(runnable_h);
     if (pit != g_jproxy_ptrs.end()) {
         uint32_t fn = 0;
+        const char *psig = nullptr;
         for (auto &rn : g_ctx->natives)
-            if (rn.name == "nativeProxyInvoke") { fn = rn.fn_va; break; }
+            if (rn.name == "nativeProxyInvoke") {
+                fn = rn.fn_va;
+                psig = rn.sig.c_str();
+                break;
+            }
         if (!fn) {
             fprintf(stderr, "[jproxy] run h=0x%x: nativeProxyInvoke not registered, skip\n",
                     runnable_h);
@@ -2712,9 +3154,19 @@ static void arm_exec_run_runnable(uint32_t runnable_h)
         if (!run_str) run_str = (uint32_t)(uintptr_t)jvm->native.NewStringUTF(env, "run");
         fprintf(stderr, "[jproxy] run h=0x%x -> nativeProxyInvoke(ptr=0x%llx, \"run\") @0x%08x\n",
                 runnable_h, (unsigned long long)pit->second, fn);
-        arm_exec_call6(fn, ENV_SLOT_BASE, rh_cls,
-                       (uint32_t)pit->second, (uint32_t)(pit->second >> 32),
-                       run_str, 0);
+        /* Must use the callback JIT: this is reached from CallSVC while the
+         * main JIT's Run() is on the stack (dynarmic asserts is_executing). */
+        bool ptr_long = psig && psig[0] == '(' && psig[1] == 'J';
+        if (ptr_long) {
+            uint32_t stk[2] = { run_str, 0 };
+            (void)call_guest_cb(*g_ctx, fn, ENV_SLOT_BASE, rh_cls,
+                                (uint32_t)pit->second,
+                                (uint32_t)(pit->second >> 32), stk, 2);
+        } else {
+            uint32_t stk[1] = { 0 };
+            (void)call_guest_cb(*g_ctx, fn, ENV_SLOT_BASE, rh_cls,
+                                (uint32_t)pit->second, run_str, stk, 1);
+        }
         return;
     }
     jclass rcls = jvm->native.GetObjectClass(env, (jobject)(uintptr_t)runnable_h);
@@ -2731,7 +3183,7 @@ static void arm_exec_run_runnable(uint32_t runnable_h)
         fprintf(stderr, "[runnable] h=0x%x class=%s run_va=0x%x\n",
                 runnable_h, cname ? cname : "(null)", run_va);
     if (run_va) {
-        arm_exec_call(run_va, ENV_SLOT_BASE, runnable_h, 0, 0);
+        (void)call_guest_cb(*g_ctx, run_va, ENV_SLOT_BASE, runnable_h, 0, 0);
         return;
     }
     bool java_side = !cname || !strcmp(cname, "java.lang.Object");
@@ -2819,6 +3271,7 @@ GL_DECL(void,    glBindTexture,          GLenum,GLuint)
 GL_DECL(void,    glActiveTexture,        GLenum)
 GL_DECL(void,    glDeleteTextures,       GLsizei,const GLuint*)
 GL_DECL(void,    glTexParameteri,        GLenum,GLenum,GLint)
+GL_DECL(void,    glGetTexParameteriv,    GLenum,GLenum,GLint*)
 GL_DECL(void,    glTexImage2D,           GLenum,GLint,GLint,GLsizei,GLsizei,GLint,GLenum,GLenum,const void*)
 GL_DECL(void,    glTexSubImage2D,        GLenum,GLint,GLint,GLint,GLsizei,GLsizei,GLenum,GLenum,const void*)
 GL_DECL(void,    glCopyTexSubImage2D,    GLenum,GLint,GLint,GLint,GLint,GLint,GLsizei,GLsizei)
@@ -2961,7 +3414,7 @@ static void load_gl_procs() {
     GL_LOAD(glGenBuffers); GL_LOAD(glBindBuffer); GL_LOAD(glBufferData);
     GL_LOAD(glBufferSubData); GL_LOAD(glDeleteBuffers);
     GL_LOAD(glGenTextures); GL_LOAD(glBindTexture); GL_LOAD(glActiveTexture);
-    GL_LOAD(glDeleteTextures); GL_LOAD(glTexParameteri);
+    GL_LOAD(glDeleteTextures); GL_LOAD(glTexParameteri); GL_LOAD(glGetTexParameteriv);
     GL_LOAD(glTexImage2D); GL_LOAD(glTexSubImage2D); GL_LOAD(glCopyTexSubImage2D);
     GL_LOAD(glCompressedTexImage2D); GL_LOAD(glCompressedTexSubImage2D);
     GL_LOAD(glGenerateMipmap);
@@ -3467,6 +3920,27 @@ static bool apk_read(const std::string &name, std::vector<uint8_t> &out) {
     return false;
 }
 
+/* Read `name`, or if missing concatenate `name.split0`+`name.split1`+… (Unity
+ * Android large-asset layout). */
+static bool apk_read_or_splits(const std::string &name, std::vector<uint8_t> &out) {
+    if (apk_read(name, out)) return true;
+    const char *dot = strrchr(name.c_str(), '.');
+    if (dot && strncmp(dot, ".split", 6) == 0 && isdigit((unsigned char)dot[6]))
+        return false;
+    out.clear();
+    for (int n = 0; n < 512; ++n) {
+        char sn[32];
+        snprintf(sn, sizeof sn, ".split%d", n);
+        std::vector<uint8_t> chunk;
+        if (!apk_read(name + sn, chunk)) break;
+        out.insert(out.end(), chunk.begin(), chunk.end());
+    }
+    if (out.empty()) return false;
+    fprintf(stderr, "[asset] read %s via %d+ splits (%zu bytes)\n",
+            name.c_str(), /* approximate */ 1, out.size());
+    return true;
+}
+
 /* True if `name` is a directory prefix of some zip entry (e.g. the APK has
  * "base/assets/bin/Data/Managed/Metadata/global-metadata.dat" so "base/assets/
  * bin/Data/Managed" is a directory). */
@@ -3550,33 +4024,147 @@ static std::map<uint32_t, GuestAsset> g_assets;
 static uint32_t g_next_asset_handle = 0xA55E7000u;
 static uint32_t g_lconv_va          = 0u;
 
+/* Match guest paths rooted at the APK mount path (ANDROID_APK_FILE on Lunaria,
+ * or ANDROID_PACKAGE_CODE_PATH when it is the .apk file itself).  Also accepts
+ * the extracted tree root so disk-mode opens keep working. */
+static bool apk_path_inner(const char *path, const char **inner_out) {
+    if (!path || !inner_out) return false;
+    const char *mount = getenv("ANDROID_APK_FILE");
+    const char *roots[3];
+    int nroots = 0;
+    if (mount && *mount) roots[nroots++] = mount;
+    if (const char *ext = getenv("ANDROID_PACKAGE_CODE_PATH")) {
+        if (!mount || strcmp(ext, mount) != 0)
+            roots[nroots++] = ext;
+    }
+    for (int i = 0; i < nroots; ++i) {
+        const char *root = roots[i];
+        size_t rlen = strlen(root);
+        if (strncmp(path, root, rlen) == 0 && path[rlen] == '/') {
+            *inner_out = path + rlen + 1;
+            return true;
+        }
+    }
+    if (const char *sfx = strstr(path, ".apk/")) {
+        *inner_out = sfx + 5;
+        return true;
+    }
+    if (strncmp(path, "assets/", 7) == 0) {
+        *inner_out = path;
+        return true;
+    }
+    if (path[0] == '/' && strncmp(path + 1, "assets/", 7) == 0) {
+        *inner_out = path + 1;
+        return true;
+    }
+    return false;
+}
+
+/* Unity Android splits assets >1MB into name.split0, name.split1, … inside
+ * the APK.  On device ArchiveFileSystem concatenates them into a single logical
+ * stream.  When the guest asks for `name` and only the split pieces exist,
+ * materialise a concatenated cache file so fopen/stat/open see the full asset
+ * (otherwise Unity opens split0 alone, seeks past 1MB → "Position out of
+ * bounds" / multi-GB fake texture sizes → OOM → wild jump through 0xCD fill). */
+static bool apk_concat_splits_to_cache(const std::string &base_inner,
+                                       char *out, size_t outsz) {
+    /* Don't recurse on an already-split name. */
+    const char *dot = strrchr(base_inner.c_str(), '.');
+    if (dot && strncmp(dot, ".split", 6) == 0 && isdigit((unsigned char)dot[6]))
+        return false;
+
+    static const char *cache_prefixes[] = {
+        "", "base/", "UnityDataAssetPack/", nullptr
+    };
+    static const char cache_root[] = "/tmp/lunaria-apk-cache";
+
+    for (int pi = 0; cache_prefixes[pi]; pi++) {
+        std::string pfx = std::string(cache_prefixes[pi]) + base_inner;
+        std::string part0 = pfx + ".split0";
+        std::vector<uint8_t> first;
+        bool have0 = false;
+        if (!asset_bridge::g_apk_dir.empty()) {
+            std::string fp0 = asset_bridge::g_apk_dir + "/" + part0;
+            struct stat sb;
+            if (stat(fp0.c_str(), &sb) == 0 && S_ISREG(sb.st_mode))
+                have0 = true;
+        } else {
+            have0 = asset_bridge::apk_read(part0, first);
+        }
+        if (!have0) continue;
+
+        if ((size_t)snprintf(out, outsz, "%s/%s", cache_root, pfx.c_str()) >= outsz)
+            return false;
+
+        /* Build / reuse concatenated file. */
+        uint64_t total = 0;
+        std::vector<std::string> parts;
+        for (int n = 0; n < 512; ++n) {
+            char sn[32];
+            snprintf(sn, sizeof sn, ".split%d", n);
+            std::string part = pfx + sn;
+            if (!asset_bridge::g_apk_dir.empty()) {
+                std::string fp = asset_bridge::g_apk_dir + "/" + part;
+                struct stat sb;
+                if (stat(fp.c_str(), &sb) != 0 || !S_ISREG(sb.st_mode)) break;
+                total += (uint64_t)sb.st_size;
+                parts.push_back(std::move(fp));
+            } else {
+                std::vector<uint8_t> chunk;
+                if (!asset_bridge::apk_read(part, chunk)) break;
+                total += chunk.size();
+                /* stash via temp paths only when writing below */
+                parts.push_back(part); /* zip entry name marker */
+            }
+        }
+        if (parts.empty()) continue;
+
+        struct stat st;
+        if (stat(out, &st) == 0 && (uint64_t)st.st_size == total && S_ISREG(st.st_mode))
+            return true;
+
+        mkdir(cache_root, 0755);
+        for (char *p = out + sizeof(cache_root); *p; ++p)
+            if (*p == '/') { *p = '\0'; mkdir(out, 0755); *p = '/'; }
+
+        FILE *wf = fopen(out, "wb");
+        if (!wf) return false;
+        bool ok = true;
+        if (!asset_bridge::g_apk_dir.empty()) {
+            for (const auto &fp : parts) {
+                FILE *rf = fopen(fp.c_str(), "rb");
+                if (!rf) { ok = false; break; }
+                char buf[1 << 16];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof buf, rf)) > 0) {
+                    if (fwrite(buf, 1, n, wf) != n) { ok = false; break; }
+                }
+                fclose(rf);
+                if (!ok) break;
+            }
+        } else {
+            for (const auto &ename : parts) {
+                std::vector<uint8_t> chunk;
+                if (!asset_bridge::apk_read(ename, chunk) ||
+                    fwrite(chunk.data(), 1, chunk.size(), wf) != chunk.size()) {
+                    ok = false; break;
+                }
+            }
+        }
+        fclose(wf);
+        if (!ok) { unlink(out); return false; }
+        fprintf(stderr, "[asset] concatenated %zu splits → %s (%llu bytes)\n",
+                parts.size(), out, (unsigned long long)total);
+        return true;
+    }
+    return false;
+}
+
 /* Materialize guest "<apk>/assets/..." paths from the APK zip into host cache */
 static bool apk_extract_to_cache(const char *path, char *out, size_t outsz) {
-    const char *apk = getenv("ANDROID_PACKAGE_CODE_PATH");
     if (!path) return false;
-    const char *inner;
-    size_t alen = apk ? strlen(apk) : 0;
-    const char *apk_suffix = strstr(path, ".apk/");
-    if (apk && strncmp(path, apk, alen) == 0 && path[alen] == '/') {
-        inner = path + alen + 1;                  /* absolute path: <code_path>/assets/... */
-    } else if (apk_suffix) {
-        /* Android semantics: resolve ".apk/assets/..." as zip entries inside the APK */
-        inner = apk_suffix + 5;
-    } else if (strncmp(path, "assets/", 7) == 0) {
-        /* Unity also opens asset files by a path relative to the (Android) data
- * root, e.g. open("assets/bin/Data/unity_app_guid").  The CWD here is
- * the Lunaria dir, so that misses on disk; resolve it against the APK too —
- * otherwise unity_app_guid reads empty and Unity loops "Will re-extract
- * il2cpp resources on next run." every frame. */
-        inner = path;
-    } else if (path[0] == '/' && strncmp(path + 1, "assets/", 7) == 0) {
-        /* Unity 2022.3 Mono constructs absolute "/assets/..." paths when the
- * code_path doesn't have the expected APK-file structure.  Strip the
- * leading '/' so it resolves the same way as the relative form. */
-        inner = path + 1;
-    } else {
-        return false;
-    }
+    const char *inner = nullptr;
+    if (!apk_path_inner(path, &inner)) return false;
     /* Standard APK path first, then App Bundle split prefixes */
     static const char *cache_prefixes[] = {
         "", "base/", "UnityDataAssetPack/", nullptr
@@ -3595,7 +4183,8 @@ static bool apk_extract_to_cache(const char *path, char *out, size_t outsz) {
                     return true;
             }
         }
-        return false;
+        /* Exact name missing — try Unity .splitN pieces. */
+        return apk_concat_splits_to_cache(inner, out, outsz);
     }
     std::vector<uint8_t> data;
     std::string inner_str;
@@ -3604,7 +4193,8 @@ static bool apk_extract_to_cache(const char *path, char *out, size_t outsz) {
         inner_str = std::string(cache_prefixes[pi]) + inner;
         if (asset_bridge::apk_read(inner_str, data)) { found = true; break; }
     }
-    if (!found) return false;
+    if (!found)
+        return apk_concat_splits_to_cache(inner, out, outsz);
     inner = inner_str.c_str();
     static const char cache_root[] = "/tmp/lunaria-apk-cache";
     if ((size_t)snprintf(out, outsz, "%s/%s", cache_root, inner) >= outsz)
@@ -3629,23 +4219,8 @@ static bool apk_extract_to_cache(const char *path, char *out, size_t outsz) {
  * entries).  Handles App Bundle prefixes the same way as extraction so that
  * stat() on e.g. ".../base.apk/assets/bin/Data/Managed" reports a directory. */
 static bool apk_path_is_dir(const char *path) {
-    if (!path) return false;
-    const char *apk = getenv("ANDROID_PACKAGE_CODE_PATH");
     const char *inner = nullptr;
-    if (apk) {
-        size_t alen = strlen(apk);
-        if (strncmp(path, apk, alen) == 0 && path[alen] == '/')
-            inner = path + alen + 1;
-    }
-    if (!inner) {
-        /* "<pkg>.apk/assets/..." — in-APK path (like apk_extract_to_cache) */
-        if (const char *sfx = strstr(path, ".apk/")) inner = sfx + 5;
-    }
-    if (!inner && path[0] == '/' && strncmp(path + 1, "assets/", 7) == 0)
-        inner = path + 1;
-    if (!inner && strncmp(path, "assets/", 7) == 0)
-        inner = path;
-    if (!inner) return false;
+    if (!apk_path_inner(path, &inner)) return false;
     static const char *prefixes[] = { "", "base/", "UnityDataAssetPack/", nullptr };
     for (int pi = 0; prefixes[pi]; pi++)
         if (asset_bridge::apk_is_dir(std::string(prefixes[pi]) + inner)) return true;
@@ -3656,15 +4231,8 @@ static bool apk_path_is_dir(const char *path) {
  * Returns true and fills `out` when `path` resolves to a zip directory. */
 static bool apk_path_list_dir(const char *path,
                               std::vector<std::pair<std::string,bool>> &out) {
-    const char *apk = getenv("ANDROID_PACKAGE_CODE_PATH");
-    if (!apk || !path) return false;
-    size_t alen = strlen(apk);
     const char *inner = nullptr;
-    if (strncmp(path, apk, alen) == 0 && path[alen] == '/')
-        inner = path + alen + 1;
-    else if (const char *sfx = strstr(path, ".apk/"))
-        inner = sfx + 5;   /* in-APK path ("<pkg>.apk/assets/...") */
-    if (!inner) return false;
+    if (!apk_path_inner(path, &inner)) return false;
     static const char *prefixes[] = { "", "base/", "UnityDataAssetPack/", nullptr };
     for (int pi = 0; prefixes[pi]; pi++) {
         std::string full = std::string(prefixes[pi]) + inner;
@@ -3681,6 +4249,28 @@ static bool apk_path_list_dir(const char *path,
  * case-sensitivity by creating /data/local/tmp/CASESENSITIVETEST<guid>;
  * without the directory that throws DirectoryNotFoundException out of the
  * first Path/File touch and aborts the game's C# initialisation. */
+/* Guest CPU topology via sysconf / /proc/cpuinfo / /sys — must stay consistent
+ * (host may have dozens of cores; sysconf already advertises 4). */
+static constexpr int GUEST_NCPU = 4;
+
+static const char *guest_sys_cpu_file(const char *tag, const char *content) {
+    /* Stable paths under /tmp; rewritten each process start is fine. */
+    static char topo[64] = "", cap[64] = "", freq[64] = "";
+    char *slot = nullptr;
+    if (strcmp(tag, "topo") == 0) slot = topo;
+    else if (strcmp(tag, "cap") == 0) slot = cap;
+    else if (strcmp(tag, "freq") == 0) slot = freq;
+    else return nullptr;
+    if (!slot[0]) {
+        snprintf(slot, 64, "/tmp/lunaria-syscpu-%s", tag);
+        if (FILE *f = fopen(slot, "w")) {
+            fputs(content, f);
+            fclose(f);
+        }
+    }
+    return slot;
+}
+
 static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
     if (!path) return path;
     if (strncmp(path, "/data/local/tmp", 15) == 0 &&
@@ -3692,6 +4282,65 @@ static const char *map_guest_path(const char *path, char *buf, size_t bufsz) {
         }();
         snprintf(buf, bufsz, "%s%s", root, path + 15);
         return buf;
+    }
+    /* The host /proc/cpuinfo is x86_64; guests parsing it for the ARM
+     * "Features:" line (FMOD probes NEON before registering its SIMD DSPs —
+     * a miss fails plugin-registry init with NEEDSHARDWARE and aborts audio)
+     * must see an ARMv7 profile consistent with SVC_GETAUXVAL's AT_HWCAP. */
+    if (strcmp(path, "/proc/cpuinfo") == 0) {
+        static const char *synth = [] {
+            const char *p = "/tmp/lunaria-proc-cpuinfo";
+            if (FILE *f = fopen(p, "w")) {
+                for (int i = 0; i < GUEST_NCPU; ++i)
+                    fprintf(f,
+                        "processor\t: %d\n"
+                        "model name\t: ARMv7 Processor rev 3 (v7l)\n"
+                        "BogoMIPS\t: 38.40\n"
+                        "Features\t: swp half thumb fastmult vfp edsp neon "
+                        "vfpv3 tls vfpv4 idiva idivt\n"
+                        "CPU implementer\t: 0x41\n"
+                        "CPU architecture: 7\n"
+                        "CPU variant\t: 0x3\n"
+                        "CPU part\t: 0xc0f\n"
+                        "CPU revision\t: 3\n\n", i);
+                fprintf(f, "Hardware\t: Lunaria ARMv7 (Device Tree)\n"
+                           "Revision\t: 0000\n"
+                           "Serial\t\t: 0000000000000000\n");
+                fclose(f);
+            }
+            return p;
+        }();
+        return synth;
+    }
+    /* Clamp host CPU topology (/sys) to GUEST_NCPU so it matches sysconf. */
+    if (strcmp(path, "/sys/devices/system/cpu/present") == 0 ||
+        strcmp(path, "/sys/devices/system/cpu/possible") == 0 ||
+        strcmp(path, "/sys/devices/system/cpu/online") == 0) {
+        char content[32];
+        snprintf(content, sizeof content, "0-%d\n", GUEST_NCPU - 1);
+        const char *f = guest_sys_cpu_file("topo", content);
+        return f ? f : path;
+    }
+    if (strncmp(path, "/sys/devices/system/cpu/cpu", 27) == 0) {
+        const char *num = path + 27;
+        char *end = nullptr;
+        long cpu = strtol(num, &end, 10);
+        if (end != num && (*end == '/' || *end == '\0')) {
+            if (cpu < 0 || cpu >= GUEST_NCPU) {
+                snprintf(buf, bufsz, "/tmp/lunaria-no-such-cpu/%ld", cpu);
+                return buf;
+            }
+            if (strcmp(end, "/cpu_capacity") == 0) {
+                const char *f = guest_sys_cpu_file("cap", "1024\n");
+                return f ? f : path;
+            }
+            if (strcmp(end, "/cpufreq/cpuinfo_max_freq") == 0 ||
+                strcmp(end, "/cpufreq/cpuinfo_min_freq") == 0 ||
+                strcmp(end, "/cpufreq/scaling_cur_freq") == 0) {
+                const char *f = guest_sys_cpu_file("freq", "1800000\n");
+                return f ? f : path;
+            }
+        }
     }
     return path;
 }
@@ -3747,6 +4396,83 @@ static uint32_t jni_arg_word(ArmExecCtx &ctx, std::array<uint32_t,16> &regs, int
     /* variant == 1 (MethodV): r3 = va_list.__ap (argument array pointer directly).
  * Android ARM32 passes va_list by value in r3; r3 itself IS the ap pointer. */
     return ctx.mem.read32(regs[3] + (uint32_t)(i * 4));
+}
+
+/* Count JNI method arguments from a JNI signature "(...)R". */
+static int jni_sig_nargs(const char *sig) {
+    if (!sig || sig[0] != '(') return 0;
+    int n = 0;
+    const char *p = sig + 1;
+    while (*p && *p != ')') {
+        ++n;
+        if (*p == 'L') {
+            while (*p && *p != ';') ++p;
+            if (*p == ';') ++p;
+        } else if (*p == '[') {
+            while (*p == '[') ++p;
+            if (*p == 'L') {
+                while (*p && *p != ';') ++p;
+                if (*p == ';') ++p;
+            } else if (*p) ++p;
+        } else {
+            ++p; /* B C D F I J S Z V */
+        }
+    }
+    return n;
+}
+
+/* Marshal guest Call*Method args into a host jvalue[].  For the common
+ * reference/int cases the low 32 bits of each guest jvalue (or stack word)
+ * are enough; jlong/jdouble need both halves of an A-slot.  Without this,
+ * Call*MethodA was always invoked with nullptr — zero-arg methods worked,
+ * but ReflectionHelper.getFieldID/getMethodID (Java methods implemented as
+ * C stubs that read values[]) SIGSEGV'd on values[1].l. */
+static int jni_marshal_jvalues(ArmExecCtx &ctx, std::array<uint32_t,16> &regs,
+                               int variant, const char *sig,
+                               jvalue *out, int maxn) {
+    if (!out || maxn <= 0) return 0;
+    int n = jni_sig_nargs(sig);
+    if (n > maxn) n = maxn;
+    if (n <= 0) return 0;
+    const char *p = (sig && sig[0] == '(') ? sig + 1 : nullptr;
+    for (int i = 0; i < n; ++i) {
+        memset(&out[i], 0, sizeof(jvalue));
+        char kind = 'L';
+        if (p && *p && *p != ')') {
+            if (*p == '[') kind = 'L';
+            else kind = *p;
+            if (*p == 'L') {
+                while (*p && *p != ';') ++p;
+                if (*p == ';') ++p;
+            } else if (*p == '[') {
+                while (*p == '[') ++p;
+                if (*p == 'L') {
+                    while (*p && *p != ';') ++p;
+                    if (*p == ';') ++p;
+                } else if (*p) ++p;
+            } else {
+                ++p;
+            }
+        }
+        if (variant == 2 && regs[3]) {
+            uint32_t lo = ctx.mem.read32(regs[3] + (uint32_t)(i * 8));
+            uint32_t hi = ctx.mem.read32(regs[3] + (uint32_t)(i * 8 + 4));
+            if (kind == 'J' || kind == 'D')
+                out[i].j = (jlong)(((uint64_t)hi << 32) | lo);
+            else if (kind == 'Z')
+                out[i].z = (jboolean)(lo & 0xffu);
+            else if (kind == 'F') {
+                uint32_t u = lo;
+                memcpy(&out[i].f, &u, 4);
+            } else
+                out[i].l = (jobject)(uintptr_t)lo;
+        } else {
+            uint32_t w = jni_arg_word(ctx, regs, variant, i);
+            if (kind == 'Z') out[i].z = (jboolean)(w & 0xffu);
+            else out[i].l = (jobject)(uintptr_t)w;
+        }
+    }
+    return n;
 }
 
 /* Try to service an asset-related JNI call host-side.  Returns true (and sets
@@ -3841,7 +4567,7 @@ static bool try_asset_jni(ArmExecCtx &ctx, uint32_t svc, std::array<uint32_t,16>
         bool found = false;
         for (int pi = 0; prefixes[pi]; pi++) {
             full = std::string(prefixes[pi]) + rel;
-            if (apk_read(full, data)) { found = true; break; }
+            if (apk_read_or_splits(full, data)) { found = true; break; }
         }
         if (!found) {
             fprintf(stderr, "[asset] open MISS %s\n", rel);
@@ -4320,8 +5046,45 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     JNIEnv     *env = &jvm->env;
     uint32_t r0=regs[0], r1=regs[1], r2=regs[2], r3=regs[3];
 
+    /* LUNARIA_SVC_HISTO: count SVCs by number; dump the top offenders every N. */
+    if (getenv("LUNARIA_SVC_HISTO")) {
+        static uint64_t histo[1024] = {}, total = 0;
+        if (svc_no < 1024) ++histo[svc_no];
+        if ((++total % 50'000'000ull) == 0) {
+            fprintf(stderr, "[svchisto] after %llu SVCs, top:\n", (unsigned long long)total);
+            for (int pass = 0; pass < 8; ++pass) {
+                int best = -1; uint64_t bv = 0;
+                for (int i = 0; i < 1024; ++i) if (histo[i] > bv) { bv = histo[i]; best = i; }
+                if (best < 0 || bv == 0) break;
+                fprintf(stderr, "[svchisto]   svc=%d count=%llu lr(last)=0x%08x\n",
+                        best, (unsigned long long)bv, regs[14]);
+                histo[best] = 0;   /* consume for next pass (restore after) */
+            }
+            /* one-shot dump then reset totals so we don't keep zeroing */
+        }
+    }
+
     auto ret32 = [&](uint32_t v)  { regs[0] = v; };
     auto ret64 = [&](uint64_t v)  { regs[0]=(uint32_t)v; regs[1]=(uint32_t)(v>>32); };
+
+    /* LUNARIA_TRACE_BADRET: a per-symbol SVC trampoline ends in `bx lr`; if the
+     * caller invoked it with a return address that is null/near-null the guest
+     * will branch to ~0 the instant the host call returns (seen as the frame-0
+     * NoExecuteFault pc=0 during the splash texture upload).  Catch it at the
+     * source: dump svc + args + a shallow guest return chain so the *caller*
+     * (which supplied lr) can be identified instead of chasing stale-lr ghosts. */
+    if (getenv("LUNARIA_TRACE_BADRET") && (regs[14] & ~1u) < 0x1000u) {
+        static int nbr = 0;
+        if (nbr++ < 24) {
+            uint32_t sp = regs[13];
+            fprintf(stderr, "[badret] svc=%u lr=0x%08x r0=%08x r1=%08x r2=%08x r3=%08x sp=0x%08x tid=%u\n",
+                    svc_no, regs[14], r0, r1, r2, r3, sp, g_current_tid);
+            for (int o = 0; o < 0x30 && ctx.mem.ptr(sp + (uint32_t)o); o += 16)
+                fprintf(stderr, "[badret]   [sp+0x%02x]=%08x %08x %08x %08x\n", o,
+                        ctx.mem.read32(sp+o), ctx.mem.read32(sp+o+4),
+                        ctx.mem.read32(sp+o+8), ctx.mem.read32(sp+o+12));
+        }
+    }
 
     /* inline-detour logging (LUNARIA_TRACE_EXC).  Fires as the first
  * instruction of a patched libmono function — regs are exactly the callee's
@@ -4339,6 +5102,29 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (verbose && nm && strstr(nm, "mono_image_open") && r0) {
             const char *p = ctx.mem.cstr(r0);
             if (p) fprintf(stderr, "[detour]   path=\"%s\" status=%#x\n", p, r1);
+        }
+        /* upload dispatcher (libunity+0x4b7c20): r0=obj (=GfxDevice+0x10a8).  Dump
+         * the two candidate texture-upload callbacks so we can see whether they
+         * are real code, an SVC trampoline, or the uninitialised 0xff/0 sentinel
+         * that causes the frame-0 pc=0 fault at `bx ip`. */
+        if (verbose && nm && strstr(nm, "thunk") && r0 >= 0x1000u) {
+            uint32_t cb184 = ctx.mem.ptr(r0 + 0x184) ? ctx.mem.read32(r0 + 0x184) : 0xdead;
+            uint32_t cb194 = ctx.mem.ptr(r0 + 0x194) ? ctx.mem.read32(r0 + 0x194) : 0xdead;
+            fprintf(stderr, "[detour]   obj=0x%08x [+0x184]=0x%08x [+0x194]=0x%08x\n",
+                    r0, cb184, cb194);
+            /* dump substructure +0x100..+0x1a0 to tell "ctor never ran (all 0)"
+             * from "ctor ran, one callback missing". */
+            for (uint32_t o = 0x100; o <= 0x1a0; o += 16) {
+                if (!ctx.mem.ptr(r0 + o)) break;
+                fprintf(stderr, "[detour]   [+0x%03x]= %08x %08x %08x %08x\n", o,
+                        ctx.mem.read32(r0+o), ctx.mem.read32(r0+o+4),
+                        ctx.mem.read32(r0+o+8), ctx.mem.read32(r0+o+12));
+            }
+            fprintf(stderr, "[detour]   [+0x40c]=%08x [+0x410]=%08x [+0x414]=%08x [+0x4d8]=%08x\n",
+                    ctx.mem.ptr(r0+0x40c)?ctx.mem.read32(r0+0x40c):0,
+                    ctx.mem.ptr(r0+0x410)?ctx.mem.read32(r0+0x410):0,
+                    ctx.mem.ptr(r0+0x414)?ctx.mem.read32(r0+0x414):0,
+                    ctx.mem.ptr(r0+0x4d8)?ctx.mem.read32(r0+0x4d8):0);
         }
         /* typelookup (0x210b4): r0=image/scope, r1=key.  It looks up r1 in the
  * g_hash_table at r0+0x70; if missing it recurses to the parent scope.
@@ -4932,6 +5718,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (nr == 192) off <<= 12;
             uint32_t addr;
             if (r0 && (r3 & 0x10u)) { /* MAP_FIXED */
+                if (guest_range_hits_loaded(r0, r1)) {
+                    static int fx = 0;
+                    if (fx++ < 8)
+                        fprintf(stderr, "[mmap0] MAP_FIXED into library rejected %#x+%#x\n",
+                                r0, r1);
+                    ret32(~0u); break;
+                }
                 addr = r0;
             } else {
                 addr = mmap_bump(r1);
@@ -5214,16 +6007,57 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         if (!strcmp(mname, "findLibrary")) {
             uint32_t str_h = jni_arg_word(ctx, regs, (int)svc_no - 34, 0);
             const char *lname = jvm->native.GetStringUTFChars(env, AS_STR(str_h), nullptr);
+            /* Android ClassLoader.findLibrary takes a bare name ("mono-native"),
+             * but Unity/mono sometimes pass a full path or "lib*.so" already.
+             * Blind "%s/lib%s.so" then yields .../lib/tmp/.../foo.so.so. */
             char lpath[4096]; lpath[0] = 0;
-            if (lname && *lname && !g_main_lib_dir.empty())
-                snprintf(lpath, sizeof(lpath), "%s/lib%s.so",
-                         g_main_lib_dir.c_str(), lname);
-            if (lpath[0] && access(lpath, F_OK) == 0) {
+            auto try_path = [&](const char *cand) -> bool {
+                if (!cand || !*cand || access(cand, F_OK) != 0) return false;
+                snprintf(lpath, sizeof(lpath), "%s", cand);
+                return true;
+            };
+            if (lname && *lname) {
+                if (strchr(lname, '/')) {
+                    /* Absolute/relative path: as-is, then +.so if missing. */
+                    if (!try_path(lname)) {
+                        size_t n = strlen(lname);
+                        if (n + 4 < sizeof(lpath) &&
+                            (n < 3 || strcmp(lname + n - 3, ".so") != 0)) {
+                            snprintf(lpath, sizeof(lpath), "%s.so", lname);
+                            if (access(lpath, F_OK) != 0) lpath[0] = 0;
+                        }
+                    }
+                } else if (!g_main_lib_dir.empty()) {
+                    const char *dir = g_main_lib_dir.c_str();
+                    size_t nl = strlen(lname);
+                    bool has_so = nl > 3 && !strcmp(lname + nl - 3, ".so");
+                    bool has_lib = nl > 3 && !strncmp(lname, "lib", 3);
+                    char cand[4096];
+                    const char *fmts[4];
+                    int nf = 0;
+                    if (has_so)
+                        fmts[nf++] = "%s/%s";
+                    else if (has_lib) {
+                        fmts[nf++] = "%s/%s.so";
+                        fmts[nf++] = "%s/%s";
+                    } else {
+                        fmts[nf++] = "%s/lib%s.so";
+                        fmts[nf++] = "%s/%s.so";
+                        fmts[nf++] = "%s/lib%s";
+                        fmts[nf++] = "%s/%s";
+                    }
+                    for (int i = 0; i < nf; ++i) {
+                        snprintf(cand, sizeof(cand), fmts[i], dir, lname);
+                        if (try_path(cand)) break;
+                    }
+                }
+            }
+            if (lpath[0]) {
                 fprintf(stderr, "[arm_jni] findLibrary(\"%s\") -> %s\n", lname, lpath);
                 RET_OBJ(jvm->native.NewStringUTF(env, lpath));
             } else {
-                fprintf(stderr, "[arm_jni] findLibrary(\"%s\") -> null (checked %s)\n",
-                        lname ? lname : "?", lpath[0] ? lpath : "(no dir)");
+                fprintf(stderr, "[arm_jni] findLibrary(\"%s\") -> null\n",
+                        lname ? lname : "?");
                 ret32(0);
             }
             break;
@@ -5234,7 +6068,8 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
          * plausible Looper/Message object lets the ctor proceed to the message
          * post, which we execute natively (see sendMessage handling). */
         /* java.lang.reflect.Method stubs created for JNIBridge.invoke carry
-         * their method name in g_method_stub_names; answer getName() with it. */
+         * their method name in g_method_stub_names; answer getName() with it.
+         * Also serve real JVM_OBJECT_METHOD / CLASS objects from GetMethodID. */
         if (!strcmp(mname, "getName")) {
             auto ns = g_method_stub_names.find(r1);
             if (ns != g_method_stub_names.end()) {
@@ -5242,6 +6077,26 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                         r1, ns->second.c_str());
                 RET_OBJ(jvm->native.NewStringUTF(env, ns->second.c_str()));
                 break;
+            }
+            if (r1 > 0 && r1 <= 65536u) {
+                auto &o = jvm->objects[r1 - 1];
+                if (o.type == jvm_object::JVM_OBJECT_METHOD && o.method.name.data) {
+                    RET_OBJ(jvm->native.NewStringUTF(env, o.method.name.data));
+                    break;
+                }
+                if (o.type == jvm_object::JVM_OBJECT_CLASS && o.klass.name.data) {
+                    RET_OBJ(jvm->native.NewStringUTF(env, o.klass.name.data));
+                    break;
+                }
+            }
+        }
+        if (!strcmp(mname, "getDeclaringClass")) {
+            if (r1 > 0 && r1 <= 65536u) {
+                auto &o = jvm->objects[r1 - 1];
+                if (o.type == jvm_object::JVM_OBJECT_METHOD && o.method.klass) {
+                    RET_OBJ(o.method.klass);
+                    break;
+                }
             }
         }
         if (!strcmp(mname, "getLooper")) {
@@ -5277,7 +6132,12 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
  * handlers and return a valid object handle (1..65536) or NULL, so the
  * common case is success and is logged only under LUNARIA_TRACE_JNI.  A
  * return outside the objects-array range IS broken, though — it would
- * later trip jvm_get_object's assert — so always surface that. */
+ * later trip jvm_get_object's assert — so always surface that.
+ *
+ * Most C stubs take va_list and tolerate a NULL args pointer (they were
+ * written for Call*MethodA(..., nullptr)).  Passing a real jvalue* into
+ * those as if it were a va_list SIGSEGVs in va_arg — so keep nullptr
+ * here unless a specific method is known to consume jvalue[]. */
         if (mid && r1) {
             uint32_t res = (uint32_t)(uintptr_t)
                 jvm->native.CallObjectMethodA(env, AS_OBJ(r1), mid, nullptr);
@@ -5739,7 +6599,30 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             RET_OBJ(pad_stub);
             break;
         }
-        /* Generic dispatch with nullptr args (works for zero-arg static methods) */
+        /* ReflectionHelper.getFieldID/getMethodID are Java methods whose
+ * fake-JVM implementations are C stubs that read jvalue[] (not va_list).
+ * Marshal guest args only for these; other static stubs still expect
+ * nullptr (va_list-style). */
+        if (mname && (!strcmp(mname, "getFieldID") || !strcmp(mname, "getMethodID"))) {
+            jvalue host_args[4];
+            int nargs = jni_marshal_jvalues(ctx, regs, (int)svc_no - 114, msig,
+                                            host_args, 4);
+            static uint64_t gm_log = 0;
+            if (gm_log < 16 || (gm_log & 0xffff) == 0)
+                fprintf(stderr, "[arm_jni] CallStatic %s nargs=%d a0=0x%x a1=0x%x a2=0x%x a3=%u (#%llu)\n",
+                        mname, nargs,
+                        nargs > 0 ? (uint32_t)(uintptr_t)host_args[0].l : 0,
+                        nargs > 1 ? (uint32_t)(uintptr_t)host_args[1].l : 0,
+                        nargs > 2 ? (uint32_t)(uintptr_t)host_args[2].l : 0,
+                        nargs > 3 ? (unsigned)host_args[3].z : 0,
+                        (unsigned long long)gm_log);
+            ++gm_log;
+            RET_OBJ(jvm->native.CallStaticObjectMethodA(env, AS_CLASS(r1), mid,
+                                                         nargs > 0 ? host_args : nullptr));
+            break;
+        }
+        /* Generic dispatch with nullptr args (works for zero-arg static methods
+ * and va_list-style stubs that null-check args). */
         RET_OBJ(jvm->native.CallStaticObjectMethodA(env, AS_CLASS(r1), mid, nullptr));
         break;
     }
@@ -6014,6 +6897,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             ret32(ARM_LIBANDROID);
             break;
         }
+        /* libOpenSLES.so: host runtime ships an x86_64 stub; the guest must not
+         * load_elf it.  Return a sentinel so dlsym can bind SL_* / slCreateEngine
+         * trampolines instead of failing the audio path with NULL. */
+        if (dpath && strstr(dpath, "libOpenSLES.so")) {
+            ret32(ARM_LIBOPENSLES);
+            break;
+        }
         /* Return NULL for files that don't actually exist on the host so that
  * mono falls back to JIT mode instead of trying to use a missing
  * AOT-precompiled .dll.so that isn't included in this APK. */
@@ -6023,9 +6913,24 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
  * prepends "lib" and appends ".so" — but Unity also passes names that
  * already carry the prefix/suffix (dlopen("libswappywrapper") used to
  * probe "liblibswappywrapper.so" and fail even though the APK ships
- * libswappywrapper.so).  Try all plausible spellings. */
+ * libswappywrapper.so).  Try all plausible spellings.
+ * Full paths without ".so" (mono probes "…/libmono-native" then
+ * "…/libmono-native.so") also need the suffix retry here. */
             bool resolved = false;
-            if (!strchr(dpath, '/') && !g_main_lib_dir.empty()) {
+            auto take = [&](const char *cand) {
+                fprintf(stderr, "[arm_exec] dlopen: resolved → %s\n", cand);
+                snprintf(lib_real, sizeof(lib_real), "%s", cand);
+                resolved = true;
+            };
+            if (strchr(dpath, '/')) {
+                size_t dl = strlen(dpath);
+                if (dl + 4 < sizeof(lib_real) &&
+                    (dl < 3 || strcmp(dpath + dl - 3, ".so") != 0)) {
+                    char cand[4096];
+                    snprintf(cand, sizeof(cand), "%s.so", dpath);
+                    if (access(cand, F_OK) == 0) take(cand);
+                }
+            } else if (!g_main_lib_dir.empty()) {
                 const char *dir = g_main_lib_dir.c_str();
                 size_t dl = strlen(dpath);
                 bool has_so = dl > 3 && !strcmp(dpath + dl - 3, ".so");
@@ -6037,12 +6942,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 for (const char *f : fmts) {
                     char cand[4096];
                     snprintf(cand, sizeof(cand), f, dir, dpath);
-                    if (access(cand, F_OK) == 0) {
-                        fprintf(stderr, "[arm_exec] dlopen: resolved bare name → %s\n", cand);
-                        snprintf(lib_real, sizeof(lib_real), "%s", cand);
-                        resolved = true;
-                        break;
-                    }
+                    if (access(cand, F_OK) == 0) { take(cand); break; }
                 }
             }
             if (!resolved) {
@@ -6178,6 +7078,36 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             }
         }
         if (r2) {
+            /* Guest VA space is 4 GB; reject wraps / OOB sizes so a corrupt
+             * guest n cannot SIGSEGV the host inside libc memmove. */
+            if ((uint64_t)r0 + r2 > 0x100000000ull ||
+                (uint64_t)r1 + r2 > 0x100000000ull ||
+                r2 >= 0x10000000u /* ≥256MB: never legitimate for this guest */) {
+                static uint64_t bad = 0;
+                if (bad < 20)
+                    fprintf(stderr, "[memmove] OOB rejected dst=0x%08x src=0x%08x "
+                            "n=0x%08x lr=0x%08x "
+                            "r3=%08x r4=%08x r5=%08x r6=%08x r7=%08x r8=%08x "
+                            "sp=%08x tid=%u\n",
+                            r0, r1, r2, regs[14],
+                            regs[3], regs[4], regs[5], regs[6], regs[7], regs[8],
+                            regs[13], g_current_tid);
+                ++bad;
+                ret32(r0);
+                break;
+            }
+            /* Flat RW arena: guest stores/memmove can scribble RX .text.
+             * Refuse writes into loaded executable (non-writable) PT_LOADs. */
+            if (guest_range_hits_rx(r0, r2)) {
+                static uint64_t rxw = 0;
+                if (rxw < 20)
+                    fprintf(stderr, "[memmove] RX write rejected dst=0x%08x src=0x%08x "
+                            "n=0x%08x lr=0x%08x tid=%u\n",
+                            r0, r1, r2, regs[14], g_current_tid);
+                ++rxw;
+                ret32(r0);
+                break;
+            }
             wrange_log(r0, r1, r2, regs[15], regs[14],
                        svc_no == SVC_MEMCPY ? "memcpy" : "memmove");
             memmove(ctx.mem.ptr(r0), ctx.mem.ptr(r1), r2);
@@ -6187,6 +7117,25 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_MEMSET: {
         if (r2) {
+            if ((uint64_t)r0 + r2 > 0x100000000ull) {
+                static uint64_t bad = 0;
+                if (bad < 20)
+                    fprintf(stderr, "[memset] OOB rejected dst=0x%08x n=0x%08x lr=0x%08x\n",
+                            r0, r2, regs[14]);
+                ++bad;
+                ret32(r0);
+                break;
+            }
+            if (guest_range_hits_rx(r0, r2)) {
+                static uint64_t rxw = 0;
+                if (rxw < 20)
+                    fprintf(stderr, "[memset] RX write rejected dst=0x%08x n=0x%08x "
+                            "c=0x%02x lr=0x%08x tid=%u\n",
+                            r0, r2, r1 & 0xFF, regs[14], g_current_tid);
+                ++rxw;
+                ret32(r0);
+                break;
+            }
             wrange_log(r0, r1 & 0xFF, r2, regs[15], regs[14], "memset");
             memset(ctx.mem.ptr(r0), (int)(r1 & 0xFF), r2);
         }
@@ -6272,6 +7221,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                 fprintf(stderr, "[arm_exec] abort() called (#%llu) lr=0x%08x tid=%u — halting run\n",
                         (unsigned long long)aborts, regs[14], g_current_tid);
             ++aborts;
+            g_guest_abort_count = aborts;
             /* On first abort, dump the guest stack to reveal the failing mono function. */
             if (first) {
                 uint32_t sp = regs[13];
@@ -6465,6 +7415,21 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32((uint32_t)h); break;
     }
     case SVC_ANW_SETBUFGEO: ret32(0u); break;
+    case SVC_ANW_LOCK: {
+        /* ANativeWindow_lock(window, ANativeWindow_Buffer* out, ARect* dirty) */
+        if (r1) {
+            int w = 1280, h = 720;
+            if (g_glfw) glfwGetWindowSize(g_glfw, &w, &h);
+            ctx.mem.write32(r1 + 0u,  (uint32_t)w);
+            ctx.mem.write32(r1 + 4u,  (uint32_t)h);
+            ctx.mem.write32(r1 + 8u,  (uint32_t)w); /* stride */
+            ctx.mem.write32(r1 + 12u, 1u);          /* RGBA_8888 */
+            ctx.mem.write32(r1 + 16u, 0u);          /* bits */
+        }
+        ret32(0u);
+        break;
+    }
+    case SVC_ANW_UNLOCK: ret32(0u); break;
 
     /* ---- ALooper ---- */
 
@@ -7125,7 +8090,18 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_GL_DeleteTextures:
         if (pfn_glDeleteTextures && r1) pfn_glDeleteTextures((GLsizei)r0,(const GLuint*)ctx.mem.ptr(r1)); break;
     case SVC_GL_TexParameteri:
+        /* LUNARIA_TRACE_GLCALLER: record the guest return address (caller) of the
+         * texture-parameter loop that immediately precedes the frame-0 pc=0
+         * fault, so the libunity loop body can be located and disassembled. */
+        if (getenv("LUNARIA_TRACE_GLCALLER")) {
+            static int ng = 0;
+            if (ng++ < 5000)
+                fprintf(stderr, "[glcaller] glTexParameteri #%d lr=0x%08x r0=%08x r1=%08x r2=%08x tid=%u\n",
+                        ng, regs[14], r0, r1, r2, g_current_tid);
+        }
         if (pfn_glTexParameteri) pfn_glTexParameteri((GLenum)r0,(GLenum)r1,(GLint)r2); break;
+    case SVC_GL_GetTexParameteriv:
+        if (pfn_glGetTexParameteriv && r2) pfn_glGetTexParameteriv((GLenum)r0,(GLenum)r1,(GLint*)ctx.mem.ptr(r2)); break;
     case SVC_GL_TexImage2D: {
         /* r0=target r1=level r2=internalfmt r3=width sp[0]=height sp[1]=border
  * sp[2]=format sp[3]=type sp[4]=pixels_va */
@@ -7762,7 +8738,15 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     case SVC_LIBC_FREAD: {
         void *buf = ctx.mem.ptr(r0);
         FILE *f = resolve_file(ctx, r3);
-        ret32((buf && f) ? (uint32_t)fread(buf, (size_t)r1, (size_t)r2, f) : 0u); break;
+        long pos = (f && getenv("LUNARIA_TRACE_READ")) ? ftell(f) : -1;
+        uint32_t n = (buf && f) ? (uint32_t)fread(buf, (size_t)r1, (size_t)r2, f) : 0u;
+        if (getenv("LUNARIA_TRACE_READ")) {
+            static uint64_t frc = 0;
+            if (frc++ < 4000)
+                fprintf(stderr, "[fread] file=%#x pos=%ld sz=%u n=%u -> %u fd=%d lr=0x%08x\n",
+                        r3, pos, r1, r2, n, f ? fileno(f) : -1, regs[14]);
+        }
+        ret32(n); break;
     }
     case SVC_LIBC_FWRITE: {
         const void *buf = ctx.mem.ptr(r0);
@@ -7771,7 +8755,14 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
     }
     case SVC_LIBC_FSEEK: {
         FILE *f = resolve_file(ctx, r0);
-        ret32(f ? (uint32_t)fseek(f, (long)(int32_t)r1, (int)r2) : ~0u); break;
+        int rc = f ? fseek(f, (long)(int32_t)r1, (int)r2) : -1;
+        if (getenv("LUNARIA_TRACE_READ")) {
+            static uint64_t fsc = 0;
+            if (fsc++ < 4000)
+                fprintf(stderr, "[fseek] file=%#x off=%ld whence=%u -> %d fd=%d lr=0x%08x\n",
+                        r0, (long)(int32_t)r1, r2, rc, f ? fileno(f) : -1, regs[14]);
+        }
+        ret32(f ? (uint32_t)rc : ~0u); break;
     }
     case SVC_LIBC_FTELL: {
         FILE *f = resolve_file(ctx, r0);
@@ -7790,6 +8781,10 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             if (apk_extract_to_cache(path, cache, sizeof cache))
                 rc = stat(cache, &st);
         }
+        if (getenv("LUNARIA_TRACE_OPEN"))
+            fprintf(stderr, "[stat->] rc=%d size=%lld mode=%o lr=0x%08x\n",
+                    rc, rc == 0 ? (long long)st.st_size : -1,
+                    rc == 0 ? st.st_mode : 0, regs[14]);
         /* Path is a directory *inside* the APK (App Bundle base/ prefix): the
  * zip has no explicit dir entry, so synthesize one.  Unity's IL2CPP
  * data installer stat()s assets/bin/Data/Managed before extracting it;
@@ -7880,6 +8875,13 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
                     r1, r2, r3, (int32_t)fd, off);
         uint32_t addr;
         if (r0 && (r3 & 0x10u)) { /* MAP_FIXED */
+            if (guest_range_hits_loaded(r0, r1)) {
+                static int fx = 0;
+                if (fx++ < 8)
+                    fprintf(stderr, "[mmap] MAP_FIXED into library rejected %#x+%#x\n",
+                            r0, r1);
+                ret32(~0u); break;
+            }
             addr = r0;
         } else {
             addr = mmap_bump(r1);
@@ -7988,7 +8990,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
  * _SC_CLK_TCK=6 */
         switch (r0) {
         case 39: ret32(4096u); break;
-        case 96: case 97: ret32(4u); break;
+        case 96: case 97: ret32((uint32_t)GUEST_NCPU); break;
         case 6:  ret32(100u); break;
         default: ret32(1u); break;
         }
@@ -8305,6 +9307,91 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         }
         break;
     }
+
+    /* --- GL extension entry points (see SVC_GLX_* comment) ------------- */
+    case SVC_GLX_DebugMessageControl:
+    case SVC_GLX_DebugMessageInsert:
+    case SVC_GLX_PushDebugGroup:
+    case SVC_GLX_PopDebugGroup:
+    case SVC_GLX_QueryCounter:
+    case SVC_GLX_MarkerNop:
+        /* Annotation/debug-output only — no rendering semantics.  A real
+ * driver's work here is invisible to the app, so a no-op is exact. */
+        break;
+    case SVC_GLX_DebugMessageCallback:
+        /* r0 = guest callback VA.  Must NOT be registered with the host GL
+ * (the host would jump to an ARM address).  Debug output stays off,
+ * which GL permits: the callback is a hint, not a contract. */
+        if (r0) {
+            static int cb_log = 0;
+            if (cb_log++ < 4)
+                fprintf(stderr, "[glx] glDebugMessageCallback(cb=0x%08x) stored, not forwarded\n", r0);
+        }
+        break;
+    case SVC_GLX_GetObjectLabel: {
+        /* (identifier, name, bufSize, length*, label*) — labels are never
+ * stored (glObjectLabel is a no-op above), so report an empty label. */
+        uint32_t len_va = r3;
+        uint32_t label_va = ctx.mem.read32(regs[13]);
+        if (len_va) ctx.mem.write32(len_va, 0u);
+        if (label_va && (int32_t)r2 > 0)
+            if (auto *p = ctx.mem.ptr(label_va)) p[0] = '\0';
+        break;
+    }
+    case SVC_GLX_BufferStorage: {
+        /* (target, size, data, flags) → host glBufferStorageEXT, else
+ * glBufferData: an immutable store downgrades to a mutable one with
+ * identical initial contents, which the guest cannot observe short of
+ * calling glGetBufferParameteriv(GL_BUFFER_IMMUTABLE_STORAGE). */
+        typedef void (*pfn_bufstor_t)(GLenum, GLsizeiptr, const void*, GLbitfield);
+        static pfn_bufstor_t host_bufstor =
+            (pfn_bufstor_t)eglGetProcAddress("glBufferStorageEXT");
+        const void *data = r2 ? (const void*)ctx.mem.ptr(r2) : nullptr;
+        if (host_bufstor)
+            host_bufstor((GLenum)r0, (GLsizeiptr)r1, data, (GLbitfield)r3);
+        else if (pfn_glBufferData)
+            pfn_glBufferData((GLenum)r0, (GLsizeiptr)r1, data, 0x88E8 /*GL_DYNAMIC_DRAW*/);
+        break;
+    }
+    case SVC_GLX_GetQueryObjectui64v: {
+        /* (id, pname, params*) — no queries run, so result=0; report
+ * RESULT_AVAILABLE=1 so pollers never spin forever. */
+        if (r2) {
+            uint32_t lo = (r1 == 0x8867u /*GL_QUERY_RESULT_AVAILABLE*/) ? 1u : 0u;
+            ctx.mem.write32(r2, lo);
+            ctx.mem.write32(r2 + 4u, 0u);
+        }
+        break;
+    }
+    case SVC_GLX_DrawElemInstBaseVertex: {
+        /* (mode, count, type, indices | instancecount, basevertex) */
+        typedef void (*pfn_deibv_t)(GLenum, GLsizei, GLenum, const void*, GLsizei, GLint);
+        static pfn_deibv_t host_deibv = []() {
+            for (const char *n : { "glDrawElementsInstancedBaseVertex",
+                                   "glDrawElementsInstancedBaseVertexEXT",
+                                   "glDrawElementsInstancedBaseVertexOES" })
+                if (auto p = (pfn_deibv_t)eglGetProcAddress(n)) return p;
+            return (pfn_deibv_t)nullptr;
+        }();
+        uint32_t instancecount = ctx.mem.read32(regs[13]);
+        uint32_t basevertex    = ctx.mem.read32(regs[13] + 4u);
+        ++g_gl_draw_count;
+        if (host_deibv)
+            host_deibv((GLenum)r0, (GLsizei)r1, (GLenum)r2,
+                g_gl_bound_elem_buf ? (const void*)(uintptr_t)r3 : ARM_CPTR(r3),
+                (GLsizei)instancecount, (GLint)basevertex);
+        break;
+    }
+    case SVC_GLX_BlendBarrier: {
+        typedef void (*pfn_blendbar_t)(void);
+        static pfn_blendbar_t host_bb = []() {
+            for (const char *n : { "glBlendBarrier", "glBlendBarrierKHR" })
+                if (auto p = (pfn_blendbar_t)eglGetProcAddress(n)) return p;
+            return (pfn_blendbar_t)nullptr;
+        }();
+        if (host_bb) host_bb();
+        break;
+    }
 #undef ARM_PTR
 #undef ARM_CPTR
 
@@ -8592,16 +9679,30 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
             it = (it->first.second == r0) ? g_tls.erase(it) : std::next(it);
         ret32(0);
         break;
-    case SVC_PTHREAD_SETSPECIFIC:
-        if (r1 == 0 && getenv("LUNARIA_TRACE_TLS"))
-            fprintf(stderr, "[arm_exec] pthread_setspecific(key=%u, NULL) lr=0x%08x tid=%u\n",
-                    r0, regs[14], g_current_tid);
-        g_tls[{g_current_tid, r0}] = r1;
+    case SVC_PTHREAD_SETSPECIFIC: {
+        /* Match pthread_self(): main uses tid 0 internally but advertises 1.
+         * Key TLS under the advertised id so set/get stay consistent if any
+         * path transiently flips g_current_tid between 0 and 1. */
+        uint32_t tid = g_current_tid ? g_current_tid : 1u;
+        if (getenv("LUNARIA_TRACE_TLS"))
+            fprintf(stderr, "[tls] set key=%u val=0x%08x tid=%u (cur=%u) lr=0x%08x\n",
+                    r0, r1, tid, g_current_tid, regs[14]);
+        g_tls[{tid, r0}] = r1;
+        /* Also keep tid=0 alias for anything stored before this normalisation. */
+        if (tid == 1u) g_tls[{0u, r0}] = r1;
         ret32(0);
         break;
+    }
     case SVC_PTHREAD_GETSPECIFIC: {
-        auto it = g_tls.find({g_current_tid, r0});
-        ret32(it != g_tls.end() ? it->second : 0u);
+        uint32_t tid = g_current_tid ? g_current_tid : 1u;
+        auto it = g_tls.find({tid, r0});
+        if (it == g_tls.end() && tid == 1u)
+            it = g_tls.find({0u, r0});
+        uint32_t val = it != g_tls.end() ? it->second : 0u;
+        if (!val && getenv("LUNARIA_TRACE_TLS"))
+            fprintf(stderr, "[tls] get MISS key=%u tid=%u (cur=%u) lr=0x%08x\n",
+                    r0, tid, g_current_tid, regs[14]);
+        ret32(val);
         break;
     }
 
@@ -10048,6 +11149,11 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         ret32(std::isfinite(v) ? 1u : 0u);
         break;
     }
+    case SVC_ISFINITEF: {
+        float v; memcpy(&v, &r0, 4);
+        ret32(std::isfinite(v) ? 1u : 0u);
+        break;
+    }
     case SVC_SIGNBIT: {
         uint64_t bits = (uint64_t)r1 << 32 | r0;
         double v; memcpy(&v, &bits, 8);
@@ -10555,7 +11661,7 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         bool found = false;
         for (int pi = 0; prefixes[pi]; pi++) {
             std::string full = std::string(prefixes[pi]) + fname;
-            if (asset_bridge::apk_read(full, data)) { found = true; break; }
+            if (asset_bridge::apk_read_or_splits(full, data)) { found = true; break; }
         }
         if (!found) {
             fprintf(stderr, "[AAsset] open MISS %s\n", fname);
@@ -10979,6 +12085,69 @@ static void dispatch_svc(ArmExecCtx &ctx, uint32_t svc_no,
         arm_exec_prepare_mono_config();
         break;
     }
+    case SVC_AEABI_IDIV0:
+    case SVC_AEABI_LDIV0: {
+        static int div0_warn = 0;
+        if (div0_warn++ < 4)
+            fprintf(stderr, "[arm_exec] __aeabi_*div0 lr=0x%08x\n", regs[14]);
+        ret32(0);
+        break;
+    }
+    case SVC_AEABI_LLSL: {
+        uint64_t val = (uint64_t)r1 << 32 | r0;
+        unsigned sh = r2 & 0xffu;
+        if (sh >= 64u) val = 0;
+        else val <<= sh;
+        regs[0] = (uint32_t)val;
+        regs[1] = (uint32_t)(val >> 32);
+        break;
+    }
+    case SVC_AEABI_LLSR: {
+        uint64_t val = (uint64_t)r1 << 32 | r0;
+        unsigned sh = r2 & 0xffu;
+        if (sh >= 64u) val = 0;
+        else val >>= sh;
+        regs[0] = (uint32_t)val;
+        regs[1] = (uint32_t)(val >> 32);
+        break;
+    }
+    case SVC_WPRINTF: {
+        /* wprintf(fmt, ...): best-effort narrow print to stderr */
+        if (!r0) { ret32(-1); break; }
+        std::string narrow;
+        for (uint32_t va = r0; ; va += 4) {
+            uint32_t wc = ctx.mem.read32(va);
+            if (!wc) break;
+            narrow += (wc < 128u) ? (char)wc : '?';
+        }
+        ArmVarArgs ap{ctx, regs, 1, regs[13], false};
+        std::string s = arm_vformat(ctx, narrow.c_str(), ap);
+        fwrite(s.data(), 1, s.size(), stderr);
+        ret32((uint32_t)(int32_t)s.size());
+        break;
+    }
+    case SVC_SWSCANF: {
+        /* swscanf(const wchar_t* s, const wchar_t* fmt, ...) */
+        if (!r0 || !r1) { ret32(-1); break; }
+        std::string src, fmt;
+        for (uint32_t va = r0; ; va += 4) {
+            uint32_t wc = ctx.mem.read32(va);
+            if (!wc) break;
+            src += (wc < 128u) ? (char)wc : '?';
+        }
+        for (uint32_t va = r1; ; va += 4) {
+            uint32_t wc = ctx.mem.read32(va);
+            if (!wc) break;
+            fmt += (wc < 128u) ? (char)wc : '?';
+        }
+        /* Guest pointers for %n etc. are not wired; sscanf into host buffer suffices
+         * for Unity's locale/format probes that only check return count. */
+        char hbuf[512] = {};
+        int n = sscanf(src.c_str(), fmt.c_str(), hbuf);
+        (void)hbuf;
+        ret32((uint32_t)(int32_t)n);
+        break;
+    }
 
     case SVC_GETRLIMIT:
         
@@ -11281,6 +12450,38 @@ public:
                     if ((w & 1) && w >= 0x000a0000u && w < 0x03400000u)
                         fprintf(stderr, "[arm_exec]   scan [sp+0x%03x]=0x%08x\n", o, w);
                 }
+                /* Recent block-entry PCs — the block that branched to 0 is the
+                 * newest non-trampoline entry, so this pins the faulting site
+                 * despite dynarmic's stale Regs()[15]. */
+                /* Log-sink chain probe: handler global @0x217ca344 → sink
+                 * [handler+0xc2c] → vtable [sink] → slot[2] [vtable+8]. */
+                if (const char *hg = getenv("LUNARIA_DUMP_SINK")) {
+                    uint32_t hga = (uint32_t)strtoul(hg, nullptr, 16);
+                    if (ctx->mem.ptr(hga)) {
+                        uint32_t h = ctx->mem.read32(hga);
+                        fprintf(stderr, "[sink] handler@0x%08x=0x%08x\n", hga, h);
+                        if (h && ctx->mem.ptr(h)) {
+                            uint32_t en = ctx->mem.read32(h + 0xc1c);
+                            uint32_t sink = ctx->mem.read32(h + 0xc2c);
+                            fprintf(stderr, "[sink]   [h+0xc1c]=0x%08x sink[h+0xc2c]=0x%08x\n", en, sink);
+                            if (sink && ctx->mem.ptr(sink)) {
+                                uint32_t vt = ctx->mem.read32(sink);
+                                fprintf(stderr, "[sink]   sink@0x%08x vtable=0x%08x\n", sink, vt);
+                                if (vt && ctx->mem.ptr(vt))
+                                    for (int k = 0; k < 6; ++k)
+                                        fprintf(stderr, "[sink]     vtable[%d]=0x%08x\n", k,
+                                                ctx->mem.read32(vt + k*4));
+                            }
+                        }
+                    }
+                }
+                fprintf(stderr, "[arm_exec]   recent block pcs (newest last):");
+                for (int i = 0; i < 64; ++i) {
+                    uint32_t p = code_ring[(code_ring_pos - 64 + i) & 63];
+                    if (p) fprintf(stderr, " %08x", p);
+                    if ((i & 15) == 15) fprintf(stderr, "\n[arm_exec]     ");
+                }
+                fprintf(stderr, "\n");
             }
             return {};
         }
@@ -11299,7 +12500,7 @@ public:
         /* Zero-word fetch = PC fell into zeroed data (heap/BSS).  Letting the
  * JIT compile multi-MB "andeq sleds" exhausts host memory in seconds. */
         if (v == 0) {
-            /* Lazy generic-trampoline fill: only mono_trampoline_code[0..11] exist. */
+            /* Bridge calls that land one word before a Mono trampoline. */
             if (g_mono_base && va >= MMAP_BASE && va < MMAP_END) {
                 const uint32_t tc = mono_sym_va("mono_trampoline_code");
                 if (tc) {
@@ -11316,23 +12517,6 @@ public:
                         uint32_t a = ctx->mem.read32(tc + t * 4u);
                         if (a && va == a - 4u)
                             return 0xEAFFFFFFu; /* b va+4 (i.e. b <trampoline entry>) */
-                    }
-                    uint32_t hit = ~0u;
-                    for (uint32_t t = 0; t < 12u; ++t) {
-                        uint32_t a = ctx->mem.read32(tc + t * 4u);
-                        if (a && va >= a && va < a + 0xc8u) { hit = t; break; }
-                    }
-                    if (hit != ~0u && hit <= 11u && !ctx->mem.read32(tc + hit * 4u)) {
-                        const uint32_t create = mono_fn_va(nullptr, 0x12d4bcu);
-                        if (create) {
-                            uint32_t addr = (uint32_t)run_arm(*ctx, create, hit, 0, 0, 0,
-                                                              50'000'000ULL);
-                            if (addr)
-                                ctx->mem.write32(tc + hit * 4u, addr);
-                        }
-                        if (jit) jit->InvalidateCacheRange(va & ~3u, 16);
-                        std::memcpy(&v, ctx->mem.ptr(va), 4);
-                        if (v) return v;
                     }
                 }
             }
@@ -11436,11 +12620,24 @@ public:
         /* Already stepping: keep the watched range live (re-hits are expected as
  * the fill loop keeps running) but let run_arm's poll do the reporting. */
     }
-    void MemoryWrite8 (uint32_t va, uint8_t  v) override { watch_hit(va,v,1); *ctx->mem.ptr(va) = v; }
+    void wwatch(uint32_t va, uint32_t v, int bytes) {
+        if (!g_wwatch_addr) return;
+        if (va + (uint32_t)bytes <= g_wwatch_addr || va > g_wwatch_addr + 3u) return;
+        fprintf(stderr, "[wwatch] store @0x%08x v=0x%08x (%dB) pc=0x%08x lr=0x%08x tid=%u\n",
+                va, v, bytes, jit ? (uint32_t)jit->Regs()[15] : 0,
+                jit ? (uint32_t)jit->Regs()[14] : 0, g_current_tid);
+    }
+    void MemoryWrite8 (uint32_t va, uint8_t  v) override { wwatch(va,v,1); watch_hit(va,v,1); *ctx->mem.ptr(va) = v; }
     void MemoryWrite16(uint32_t va, uint16_t v) override {
-        watch_hit(va,v,2); memcpy(ctx->mem.ptr(va), &v, 2); }
+        wwatch(va,v,2); watch_hit(va,v,2); memcpy(ctx->mem.ptr(va), &v, 2); }
     void MemoryWrite32(uint32_t va, uint32_t v) override {
-        watch_hit(va,v,4); memcpy(ctx->mem.ptr(va), &v, 4); }
+        if (g_step_on_val_set && v == g_step_on_val && !g_steptrace_armed &&
+            (!g_step_on_addr_set || va == g_step_on_addr) &&
+            g_global_ticks >= g_step_after_ticks) {
+            g_steptrace_armed = true;
+            if (jit) jit->HaltExecution();
+        }
+        wwatch(va,v,4); watch_hit(va,v,4); memcpy(ctx->mem.ptr(va), &v, 4); }
     void MemoryWrite64(uint32_t va, uint64_t v) override {
         watch_hit(va,(uint32_t)v,8); memcpy(ctx->mem.ptr(va), &v, 8); }
 
@@ -11532,21 +12729,95 @@ public:
             if(!pc_in_sentinel(pc)) {
                 static int nef = 0;
                 if (nef++ < 4 && jit) {
-                    uint32_t sp = jit->Regs()[13];
+                    auto &rr = jit->Regs();
+                    uint32_t sp = rr[13];
+                    uint32_t cpsr = jit->Cpsr();
+                    uint32_t word = 0;
+                    if (ctx->mem.ptr(pc & ~1u))
+                        std::memcpy(&word, ctx->mem.ptr(pc & ~1u), 4);
                     fprintf(stderr, "[arm_exec] NoExecuteFault at pc=0x%08x "
-                            "lr=0x%08x r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x sp=0x%08x — halting\n",
-                            pc, jit->Regs()[14], jit->Regs()[0], jit->Regs()[1],
-                            jit->Regs()[2], jit->Regs()[3], sp);
-                    /* dump stack for LR chain */
+                            "lr=0x%08x r0=0x%08x r1=0x%08x r2=0x%08x r3=0x%08x "
+                            "sp=0x%08x cpsr=0x%08x tid=%u word[pc]=0x%08x — halting\n",
+                            pc, rr[14], rr[0], rr[1], rr[2], rr[3], sp, cpsr,
+                            g_current_tid, word);
+                    fprintf(stderr, "[arm_exec]   r4=%08x r5=%08x r6=%08x r7=%08x "
+                            "r8=%08x r9=%08x r10=%08x r11=%08x r12=%08x\n",
+                            rr[4], rr[5], rr[6], rr[7], rr[8], rr[9], rr[10],
+                            rr[11], rr[12]);
                     fprintf(stderr, "[arm_exec] stack[sp..sp+40]:");
                     for (int _i = 0; _i < 10; ++_i) {
                         uint32_t v = ctx->mem.read32(sp + (uint32_t)(_i * 4));
                         fprintf(stderr, " %08x", v);
                     }
                     fprintf(stderr, "\n");
+                    fprintf(stderr, "[arm_exec]   bytes[pc-8..pc+8]:");
+                    for (int off = -8; off < 12; ++off) {
+                        uint32_t a = (pc & ~1u) + (uint32_t)off;
+                        if (ctx->mem.ptr(a))
+                            fprintf(stderr, " %02x", *ctx->mem.ptr(a));
+                        else
+                            fprintf(stderr, " ??");
+                    }
+                    fprintf(stderr, "\n");
                 }
+                /* libunity texture upload: +0x4b7c94 bx r12 with r12 from [r6+0x184/0x194].
+                 * lr=+0x4a508c is the BL return in the caller at +0x4a4fe0. */
+                if (getenv("LUNARIA_TRACE_TEXCB") && jit) {
+                    uint32_t lr = jit->Regs()[14] & ~1u;
+                    if (lr >= 0x20865080u && lr <= 0x20865094u) {
+                        auto &r = jit->Regs();
+                        uint32_t r6 = r[6];
+                        uint32_t cb184 = (r6 >= 0x1000u && ctx->mem.ptr(r6 + 0x184))
+                                         ? ctx->mem.read32(r6 + 0x184) : 0;
+                        uint32_t cb194 = (r6 >= 0x1000u && ctx->mem.ptr(r6 + 0x194))
+                                         ? ctx->mem.read32(r6 + 0x194) : 0;
+                        fprintf(stderr,
+                                "[texcb] bx-r12 fault lr=0x%08x r1=%08x r6=0x%08x "
+                                "[r6+0x184]=0x%08x [r6+0x194]=0x%08x r4=%08x r5=%08x r8=%08x\n",
+                                lr, r[1], r6, cb184, cb194, r[4], r[5], r[8]);
+                        if (r6 >= 0x1000u && ctx->mem.ptr(r6)) {
+                            fprintf(stderr, "[texcb]   tex obj head:");
+                            for (int o = 0; o < 0x40; o += 4)
+                                fprintf(stderr, " %08x", ctx->mem.read32(r6 + o));
+                            fprintf(stderr, "\n");
+                            uint32_t vt = ctx->mem.read32(r6);
+                            if (vt >= 0x1000u && ctx->mem.ptr(vt + 0x770))
+                                fprintf(stderr, "[texcb]   vtable[+0x770]=0x%08x\n",
+                                        ctx->mem.read32(vt + 0x770));
+                            uint32_t parent = r6 - 0x10a8u;
+                            if (parent >= 0x1000u && ctx->mem.ptr(parent + 0x124)) {
+                                uint32_t tex = ctx->mem.read32(parent + 0x124);
+                                fprintf(stderr, "[texcb]   parent=0x%08x tex@+0x124=0x%08x "
+                                        "[tex+0x184]=0x%08x [tex+0x194]=0x%08x\n",
+                                        parent, tex,
+                                        tex ? ctx->mem.read32(tex + 0x184) : 0,
+                                        tex ? ctx->mem.read32(tex + 0x194) : 0);
+                                fprintf(stderr, "[texcb]   parent head:");
+                                for (int o = 0; o < 0x50; o += 4)
+                                    fprintf(stderr, " %08x", ctx->mem.read32(parent + o));
+                                fprintf(stderr, "\n");
+                                fprintf(stderr, "[texcb]   parent+0x124=0x%08x "
+                                        "+0x128=0x%08x +0x12c=0x%08x\n",
+                                        ctx->mem.read32(parent + 0x124),
+                                        ctx->mem.read32(parent + 0x128),
+                                        ctx->mem.read32(parent + 0x12c));
+                                if (ctx->mem.ptr(parent + 0x14)) {
+                                    char pbuf[256]; size_t pi = 0;
+                                    for (uint32_t o = 0x14; o < 0x200 && pi + 4 < sizeof pbuf; o += 4) {
+                                        uint32_t w = ctx->mem.read32(parent + o);
+                                        memcpy(pbuf + pi, &w, 4); pi += 4;
+                                    }
+                                    pbuf[sizeof pbuf - 1] = '\0';
+                                    fprintf(stderr, "[texcb]   path@+0x14: %s\n", pbuf);
+                                }
+                            }
+                        }
+                    }
+                }
+                if(jit) jit->HaltExecution();
+            } else {
+                if(jit) jit->HaltExecution();
             }
-            if(jit) jit->HaltExecution();
             return;
         }
         uint32_t instr = 0;
@@ -11622,12 +12893,92 @@ public:
     void AddTicks(uint64_t t) override {
         uint64_t prev = ticks;
         ticks += t;
+        g_global_ticks = ticks;
+        /* LUNARIA_STEP_AFTER: halt block-JIT mid-run when the tick budget is
+         * crossed so the run_arm loop can switch to per-instruction Step()
+         * before a fault in the same Run() buries the PC trail. */
+        if (g_step_after_mark && !g_stepa_requested &&
+            prev < g_step_after_mark && ticks >= g_step_after_mark && jit) {
+            g_stepa_requested = true;
+            jit->HaltExecution();
+        }
         if (jit) {
             uint32_t p = jit->Regs()[15];
             pc_ring[pc_ring_pos++ & 63] = p;
             if ((p & ~1u) < 0x41000000u) code_ring[code_ring_pos++ & 63] = p;
+            /* LUNARIA_CATCH_NULL_BLK: when a block's successor is 0 (branch to
+             * null), the block that just ran is the culprit; with block-linking
+             * off (NO_OPT) AddTicks fires per block so pc_ring[-2] is its entry. */
+            if (getenv("LUNARIA_CATCH_NULL_BLK") && (p & ~1u) < 0x1000u) {
+                static int cnb = 0;
+                if (cnb++ < 4) {
+                    fprintf(stderr, "[catchnull] successor=0x%08x  culprit-block-entry=0x%08x\n",
+                            p, pc_ring[(pc_ring_pos - 2) & 63]);
+                    fprintf(stderr, "[catchnull]   prev entries:");
+                    for (int i = 2; i <= 10; ++i)
+                        fprintf(stderr, " %08x", pc_ring[(pc_ring_pos - 1 - i) & 63]);
+                    fprintf(stderr, "\n[catchnull]   cpsr=0x%08x r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r14=%08x\n",
+                            jit->Cpsr(), (uint32_t)jit->Regs()[0], (uint32_t)jit->Regs()[1],
+                            (uint32_t)jit->Regs()[2], (uint32_t)jit->Regs()[3],
+                            (uint32_t)jit->Regs()[4], (uint32_t)jit->Regs()[14]);
+                }
+            }
+            if (g_steptrace_trigger && !g_steptrace_armed &&
+                (p & ~1u) == g_steptrace_trigger) {
+                g_steptrace_armed = true;
+                jit->HaltExecution();
+            }
+            /* LUNARIA_TRACE_ENTER=hexva[,hexva...]: dump regs + stack args the
+             * first N times a watched block executes (valid Regs here). */
+            static uint32_t enter_vas[8] = {};
+            static int enter_n = -1, enter_hits = 0;
+            if (enter_n < 0) {
+                enter_n = 0;
+                if (const char *e = getenv("LUNARIA_TRACE_ENTER")) {
+                    char tmp[256]; snprintf(tmp, sizeof tmp, "%s", e);
+                    for (char *t = strtok(tmp, ","); t && enter_n < 8; t = strtok(nullptr, ","))
+                        enter_vas[enter_n++] = (uint32_t)strtoul(t, nullptr, 16) & ~1u;
+                }
+            }
+            uint32_t pa = p & ~1u;
+            for (int i = 0; i < enter_n; ++i)
+                if (pa == enter_vas[i] && enter_hits++ < 12) {
+                    auto &r = jit->Regs();
+                    uint32_t sp = r[13];
+                    fprintf(stderr, "[enter] pc=0x%08x lr=0x%08x r0=%08x r1=%08x "
+                            "r2=%08x r3=%08x sp=0x%08x tid=%u\n",
+                            pa, r[14], r[0], r[1], r[2], r[3], sp, g_current_tid);
+                    for (int o = 0; o < 0x30 && ctx->mem.ptr(sp + o); o += 16)
+                        fprintf(stderr, "[enter]   [sp+0x%02x]=%08x %08x %08x %08x\n", o,
+                                ctx->mem.read32(sp+o), ctx->mem.read32(sp+o+4),
+                                ctx->mem.read32(sp+o+8), ctx->mem.read32(sp+o+12));
+                }
+            /* LUNARIA_TRACE_RANGE_ENTER=lo:hi — dump regs on each transition from
+             * outside [lo,hi) into it (catches mid-function entries). */
+            static uint32_t re_lo = 0, re_hi = 0, re_prev = 0; static int re_n = 0, re_init = 0;
+            if (!re_init) { re_init = 1;
+                if (const char *e = getenv("LUNARIA_TRACE_RANGE_ENTER"))
+                    sscanf(e, "%x:%x", &re_lo, &re_hi); }
+            if (re_hi) {
+                bool in = pa >= re_lo && pa < re_hi;
+                /* Treat trampoline returns (0x41xxxxxx) as "inside" so renter
+                 * only fires on genuine external callers, not stub returns. */
+                bool pin = (re_prev >= re_lo && re_prev < re_hi) ||
+                           (re_prev >= 0x41000000u && re_prev < 0x42000000u);
+                if (in && !pin && re_n++ < 16) {
+                    auto &r = jit->Regs(); uint32_t sp = r[13];
+                    fprintf(stderr, "[renter] pc=0x%08x from=0x%08x lr=0x%08x "
+                            "r0=%08x r1=%08x r2=%08x r3=%08x sp=0x%08x\n",
+                            pa, re_prev, r[14], r[0], r[1], r[2], r[3], sp);
+                    for (int o = 0; o < 0x30 && ctx->mem.ptr(sp + o); o += 16)
+                        fprintf(stderr, "[renter]   [sp+0x%02x]=%08x %08x %08x %08x\n", o,
+                                ctx->mem.read32(sp+o), ctx->mem.read32(sp+o+4),
+                                ctx->mem.read32(sp+o+8), ctx->mem.read32(sp+o+12));
+                }
+                re_prev = pa;
+            }
         }
-        
+
         static const bool prof = getenv("LUNARIA_PROF") != nullptr;
         if (prof && jit) {
             static std::map<uint32_t, uint64_t> buckets;
@@ -12268,6 +13619,29 @@ static void build_jni_tables(ArmExecCtx &ctx) {
     ctx.mem.write32(LIBC_PAGE_SIZE,  4096u);
     ctx.mem.write32(LIBC_PAGE_SHIFT, 12u);
     ctx.mem.write32(LIBC_PAGE_MASK,  0xfffu);
+    /* bionic _ctype_ / _tolower_tab_ data exports (must be real guest memory,
+     * not SVC trampolines — libc code indexes these tables directly). */
+    {
+        uint8_t *ct = ctx.mem.ptr(LIBC_CTYPE_TAB);
+        ct[0] = 0;
+        for (int i = 0; i < 256; ++i) {
+            uint8_t f = 0;
+            if (i == ' ') f = 0x88u;
+            else if (i >= 'a' && i <= 'z') f = 0x42u;
+            else if (i >= 'A' && i <= 'Z') f = 0x41u;
+            else if (i >= '0' && i <= '9') f = 0x04u;
+            else if (strchr("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~", i)) f = 0x10u;
+            else if (i < 0x20 || i == 0x7f) f = 0x20u;
+            ct[1 + i] = f;
+        }
+        for (uint32_t i = 0; i < 257; ++i) {
+            int c = (i == 0) ? EOF : (int)(i - 1);
+            int lo = c;
+            if (c >= 'A' && c <= 'Z') lo = c + ('a' - 'A');
+            uint16_t v = (uint16_t)(int16_t)lo;
+            memcpy(ctx.mem.ptr(LIBC_TOLOWER_TAB + i * 2), &v, 2);
+        }
+    }
     /* noop stub — mov r0,#0 (e3a00000); bx lr (e12fff1e).
  * Used as substitute target when blx r12 would call a heap/null address. */
     ctx.mem.write32(NOOP_RET0,     0xe3a00000u); /* mov r0, #0 */
@@ -12300,37 +13674,52 @@ static void build_jni_tables(ArmExecCtx &ctx) {
  * base_addr: added to all virtual addresses (for loading at non-zero base)
  * ---------------------------------------------------------------------- */
 
-/* mono_add_internal_call (0x198154) inserts into the BSS global icall_hash
- * @ +0x3bfb8c without lazily creating it (mono_icall_init only runs inside
- * mono_init, but Unity registers internal calls from initJni first), so the
- * first registration hits ghashtable.c:184.  Pre-create icall_hash exactly the
- * way mono itself would: g_hash_table_new(g_str_hash, g_str_equal) — the keys
- * are strdup'd icall names and mono_lookup_internal_call looks them up with a
- * freshly-built string, so a direct-pointer hash would never match.
- * Do NOT touch jit_icall_hash_name/addr @ +0x3bfb90/94: mono_register_jit_icall
- * (0x199208) lazily creates them with the correct hash functions when the name
- * slot is still NULL.  Pre-filling them with direct-hash tables made every
+/* Some Unity Mono builds register internal calls before mono_init creates
+ * icall_hash. Discover the slot and its normal constructor sequence from
+ * mono_add_internal_call's relocated ARM code, then create the table with
+ * Mono's own g_str_hash/g_str_equal callbacks. The keys are duplicated strings,
+ * so a direct-pointer hash would never match later lookups.
+ * Do not touch jit_icall_hash_name/addr: mono_register_jit_icall lazily creates
+ * them with the correct hash functions. Pre-filling them made every
  * mono_find_jit_icall_by_name lookup miss ("unknown MONO_PATCH_INFO_INTERNAL_
  * METHOD mono_get_lmf_addr", mini.c:4500 `callinfo' assert) and broke all JIT
  * compilation. */
-static void ensure_mono_icall_hashes(ArmExecCtx &ctx, uint32_t mono_base) {
+static void ensure_mono_icall_hashes(ArmExecCtx &ctx) {
     if (getenv("LUNARIA_ICALL_HASH_INIT") && strcmp(getenv("LUNARIA_ICALL_HASH_INIT"), "0") == 0)
         return;
-    const uint32_t slot = mono_base + 0x3bfb8cu;   /* icall_hash */
-    if (ctx.mem.read32(slot) != 0) return;
-    const uint32_t ghash_new = mono_fn_va(nullptr, 0x2b66d8u); /* g_hash_table_new */
-    /* g_str_hash / g_str_equal: eglib statics, reachable via libmono's own
- * relocated GOT entries (same slots mono_register_jit_icall loads from). */
-    const uint32_t str_hash = ctx.mem.read32(mono_base + 0x3b8a74u);
-    const uint32_t str_eq   = ctx.mem.read32(mono_base + 0x3b8e3cu);
-    if (!ghash_new || !str_hash || !str_eq) {
-        fprintf(stderr, "[arm_exec] icall_hash init skipped (new=%#x hash=%#x eq=%#x)\n",
-                ghash_new, str_hash, str_eq);
+
+    const uint32_t add_icall = mono_sym_va("mono_add_internal_call");
+    if (!add_icall) {
+        fprintf(stderr, "[arm_exec] icall_hash: mono_add_internal_call not found\n");
         return;
     }
-    uint32_t tbl = (uint32_t)run_arm(ctx, ghash_new, str_hash, str_eq, 0, 0, 50'000'000ULL);
+    const uint32_t slot = mono_arm_pic_global(ctx, add_icall, 0);
+    if (!slot) {
+        fprintf(stderr, "[arm_exec] icall_hash: PIC global slot not found\n");
+        return;
+    }
+    if (ctx.mem.read32(slot) != 0) return;
+
+    const uint32_t store_va = mono_find_str_to_slot(ctx, slot);
+    const uint32_t bl_va = store_va ? mono_bl_before(ctx, store_va) : 0;
+    const uint32_t create_fn = bl_va ? arm_bl_dest(bl_va, ctx.mem.read32(bl_va)) : 0;
+    const uint32_t fn = store_va ? mono_fn_start(ctx, store_va) : 0;
+    const uint32_t got_r4 = fn ? mono_fn_got_r4(ctx, fn) : 0;
+    uint32_t hash_fn = 0, eq_fn = 0, extra = 0;
+    const bool got_ok = bl_va && got_r4 &&
+        mono_read_got_triple_before_bl(ctx, bl_va, got_r4, hash_fn, eq_fn, extra);
+
+    if (!create_fn || !got_ok) {
+        fprintf(stderr, "[arm_exec] icall_hash init failed (store=%#x bl=%#x create=%#x "
+                "got=%#x hash=%#x eq=%#x)\n",
+                store_va, bl_va, create_fn, got_r4, hash_fn, eq_fn);
+        return;
+    }
+
+    const uint32_t tbl = (uint32_t)run_arm(ctx, create_fn, hash_fn, eq_fn, extra, 0,
+                                           50'000'000ULL);
     if (!tbl) {
-        fprintf(stderr, "[arm_exec] g_hash_table_new failed for icall_hash\n");
+        fprintf(stderr, "[arm_exec] icall_hash create_fn %#x returned 0\n", create_fn);
         return;
     }
     ctx.mem.write32(slot, tbl);
@@ -12642,6 +14031,20 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
         }
     }
 
+    /* Weak linker symbols data_start / __data_start must resolve to this
+     * module's writable .data, not an SVC trampoline address. */
+    g_reloc_data_start = base_addr;
+    if (ehdr->e_shstrndx < ehdr->e_shnum) {
+        const char *shstr = (const char *)(buf.data() + shdrs[ehdr->e_shstrndx].sh_offset);
+        for (int i = 0; i < ehdr->e_shnum; ++i) {
+            const char *sname = shstr + shdrs[i].sh_name;
+            if (shdrs[i].sh_type == SHT_PROGBITS && strcmp(sname, ".data") == 0) {
+                g_reloc_data_start = base_addr + shdrs[i].sh_addr;
+                break;
+            }
+        }
+    }
+
     /* Trampoline address for a given SVC number */
     auto tramp = [](uint32_t n){ return TRAMP_BASE + n * TRAMP_STRIDE; };
 
@@ -12838,6 +14241,33 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
                 }
             }
         }
+        if (strstr(path, "libunity.so") && getenv("LUNARIA_DUMP_GFX")) {
+            uint32_t reg = unity_probe_fmt_registry(ctx);
+            fprintf(stderr, "[gfx] fmt registry=0x%08x\n", reg);
+            if (reg && ctx.mem.ptr(reg + 0x24u)) {
+                uint32_t tbl = ctx.mem.read32(reg + 0x1cu);
+                fprintf(stderr, "[gfx]   tbl=0x%08x def=%u\n", tbl,
+                        ctx.mem.read32(reg + 0x20u));
+                for (unsigned i = 0; i < 8; ++i) {
+                    uint32_t d = unity_lookup_format_desc(ctx, reg, i);
+                    if (!d) continue;
+                    fprintf(stderr, "[gfx]   [%u] desc=0x%08x id=%u cb=0x%08x\n", i, d,
+                            ctx.mem.read32(d + 0x10u), ctx.mem.read32(d + 0x184u));
+                }
+            }
+            uint32_t scan = unity_scan_format_desc(ctx, 6);
+            fprintf(stderr, "[gfx] scan fmt6 desc=0x%08x\n", scan);
+        }
+        if (strstr(path, "libunity.so")) {
+            uint32_t probe = base_addr + 0xec7ad0u;
+            fprintf(stderr, "[gfx] table@0x%08x:", probe);
+            for (int i = 0; i < 4; ++i) {
+                uint32_t e = probe + (uint32_t)i * 0x2b8u;
+                fprintf(stderr, " id%d=%u cb=0x%08x", i,
+                        ctx.mem.read32(e + 0x10u), ctx.mem.read32(e + 0x184u));
+            }
+            fprintf(stderr, "\n");
+        }
     }
     /* libmono assembly loader: mono_path_resolve_symlinks() returns a plain path
  * without a "file://" prefix, so try_open_assembly() never enters its fopen
@@ -12845,6 +14275,7 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
  * Route the path helpers through SVC handlers that speak host file:// URIs. */
     if (strstr(path, "libmono.so")) {
         g_mono_base = base_addr;
+        g_mono_hi = lib_hi;
         hook_export_to_svc(ctx, "mono_path_resolve_symlinks", SVC_MONO_PATH_NORM);
         hook_export_to_svc(ctx, "mono_path_canonicalize",     SVC_MONO_PATH_NORM);
         /* Internal g_filename_from_uri is exported as mono_escape_uri_string in
@@ -12877,7 +14308,7 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
             const uint32_t stub = build_g_build_filename_stub(ctx, g_g_build_filename_tramp);
             redirect_va(ctx, gbf, stub, "g_build_filename");
         }
-        ensure_mono_icall_hashes(ctx, base_addr);
+        ensure_mono_icall_hashes(ctx);
         
         if (getenv("LUNARIA_TRACE_MONO")) {
             install_inline_detour(ctx, base_addr + 0x13c890u, "mono_assembly_open_full");
@@ -12921,6 +14352,7 @@ static bool load_elf(ArmExecCtx &ctx, const char *path,
         }
     }
     if (strstr(path, "libunity.so")) {
+        g_unity_base = base_addr;
         if (const char *begin = memmem_buf(buf.data(), buf.size(), "<configuration>")) {
             const char *close = strstr(begin, "</configuration>");
             if (close) {
@@ -12982,8 +14414,35 @@ static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
             fprintf(stderr, "[wrange] watching [0x%08x,0x%08x)\n",
                     g_wrange_lo, g_wrange_hi);
         }
+        /* LUNARIA_WATCH=lo:hi — arm the precise single-step wild-store capture
+         * over an explicit guest range (default path only sets a class slot). */
+        if (const char *w = getenv("LUNARIA_WATCH"))
+            if (strchr(w, ':') && sscanf(w, "%x:%x", &g_watch_lo, &g_watch_hi) == 2)
+                fprintf(stderr, "[watch] precise capture [0x%08x,0x%08x)\n",
+                        g_watch_lo, g_watch_hi);
+        if (const char *st = getenv("LUNARIA_STEP_TRACE"))
+            g_steptrace_trigger = (uint32_t)strtoul(st, nullptr, 16) & ~1u;
+        if (const char *sv = getenv("LUNARIA_STEP_ON_VAL")) {
+            g_step_on_val = (uint32_t)strtoul(sv, nullptr, 16);
+            g_step_on_val_set = true;
+        }
+        if (const char *sa = getenv("LUNARIA_STEP_ON_ADDR")) {
+            g_step_on_addr = (uint32_t)strtoul(sa, nullptr, 16);
+            g_step_on_addr_set = true;
+        }
+        if (const char *st2 = getenv("LUNARIA_STEP_AFTER_TICKS"))
+            g_step_after_ticks = strtoull(st2, nullptr, 0);
+        if (const char *ww = getenv("LUNARIA_WWATCH")) {
+            g_wwatch_addr = (uint32_t)strtoul(ww, nullptr, 16);
+            fprintf(stderr, "[wwatch] watching stores to 0x%08x\n", g_wwatch_addr);
+        }
+        if (getenv("LUNARIA_NO_OPT")) {
+            cfg.optimizations = Dynarmic::no_optimizations;
+            fprintf(stderr, "[arm_exec] JIT optimizations DISABLED\n");
+        }
         if (!getenv("LUNARIA_WATCH") && !getenv("LUNARIA_WATCH_EXC_TYPE") &&
-            !g_wrange_hi) {
+            !getenv("LUNARIA_STEP_ON_VAL") && !getenv("LUNARIA_STEP_RANGE") &&
+            !getenv("LUNARIA_WWATCH") && !g_wrange_hi) {
             cfg.fastmem_pointer = (uintptr_t)ctx.mem.host;
             cfg.recompile_on_fastmem_failure = true;
         }
@@ -13040,7 +14499,94 @@ static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
      * is raised, or the per-call tick limit is reached. */
     Dynarmic::HaltReason hr;
     uint64_t hb_next = 500'000'000ULL;          /* heartbeat every 500M ticks */
+    /* LUNARIA_STEP_AFTER=<ticks>: once the tick budget passes this mark, drive
+     * the guest one instruction at a time on the main thread, keeping a ring of
+     * the last PCs so a jump-to-null dumps the exact instruction stream that led
+     * there (AddTicks/block-linking hide it otherwise). */
+    static const uint64_t step_after =
+        getenv("LUNARIA_STEP_AFTER") ? strtoull(getenv("LUNARIA_STEP_AFTER"), nullptr, 0) : 0;
+    if (step_after && !g_step_after_mark) g_step_after_mark = step_after;
+    static bool stepa_active = false;
+    stepa_active = false;
+    /* LUNARIA_STEP_RANGE=lo:hi[,lo:hi...] — force the interpreter (per-instruction
+     * Step) for any PC inside a listed [lo,hi).  Bypasses block-JIT miscompilation
+     * in specific guest functions while keeping the fast JIT everywhere else. */
+    static uint32_t srange_lo[8] = {}, srange_hi[8] = {};
+    static int      srange_n = 0;
+    static bool srange_parsed = false;
+    if (!srange_parsed) { srange_parsed = true;
+        if (const char *sr = getenv("LUNARIA_STEP_RANGE")) {
+            char tmp[256]; snprintf(tmp, sizeof tmp, "%s", sr);
+            for (char *t = strtok(tmp, ","); t && srange_n < 8; t = strtok(nullptr, ",")) {
+                srange_lo[srange_n] = (uint32_t)strtoul(t, nullptr, 16);
+                const char *c = strchr(t, ':');
+                srange_hi[srange_n] = c ? (uint32_t)strtoul(c + 1, nullptr, 16) : 0;
+                if (srange_hi[srange_n]) {
+                    fprintf(stderr, "[srange] interpreter fallback for [0x%08x,0x%08x)\n",
+                            srange_lo[srange_n], srange_hi[srange_n]);
+                    ++srange_n;
+                }
+            }
+        }
+    }
     for (;;) {
+        if (srange_n) {
+            uint32_t p = (uint32_t)ctx.jit->Regs()[15] & ~1u;
+            bool in = false;
+            for (int i = 0; i < srange_n; ++i)
+                if (p >= srange_lo[i] && p < srange_hi[i]) { in = true; break; }
+            if (in) {
+                ctx.jit->ClearHalt(HR::UserDefined1 | HR::Step);
+                hr = ctx.jit->Step();
+                if (Dynarmic::Has(hr, HR::CacheInvalidation)) { ctx.jit->ClearHalt(HR::CacheInvalidation); hr &= ~HR::CacheInvalidation; }
+                /* Step() returns HR::Step (0x1) as its single-step marker; it is
+                 * benign — clearing it lets the interpreter fallback resume the
+                 * same guest call instead of returning early (which would abort
+                 * nativeRender mid-PlayerLoop and force Unity to re-init). */
+                hr &= ~HR::Step;
+                cb.periodic_yield = false;
+                if (hr != Dynarmic::HaltReason{}) break;
+                if (pc_in_sentinel((uint32_t)ctx.jit->Regs()[15])) break;
+                if (cb.ticks >= max_ticks) break;
+                continue;
+            }
+        }
+        if (step_after && cb.ticks >= step_after) {
+            static uint32_t sring[256]; static uint32_t sringpos = 0; static uint64_t stotal = 0;
+            if (!stepa_active) {
+                stepa_active = true;
+                g_stepa_requested = false;
+                fprintf(stderr, "[stepa] entering single-step mode at ticks=%llu pc=0x%08x\n",
+                        (unsigned long long)cb.ticks, (uint32_t)ctx.jit->Regs()[15]);
+            }
+            auto &R = ctx.jit->Regs();
+            uint32_t p = (uint32_t)R[15];
+            if ((p & ~1u) < 0x1000u) {
+                fprintf(stderr, "[stepa] JUMP-TO-NULL: last 64 PCs (newest last):\n");
+                for (int i = 0; i < 64; ++i) {
+                    uint32_t q = sring[(sringpos - 64 + i) & 255];
+                    fprintf(stderr, " %08x", q);
+                    if ((i & 15) == 15) fprintf(stderr, "\n");
+                }
+                fprintf(stderr, "[stepa] regs: r0=%08x r1=%08x r2=%08x r3=%08x lr=%08x sp=%08x\n",
+                        (uint32_t)R[0],(uint32_t)R[1],(uint32_t)R[2],(uint32_t)R[3],
+                        (uint32_t)R[14],(uint32_t)R[13]);
+                hr = Dynarmic::HaltReason{}; break;
+            }
+            sring[sringpos++ & 255] = p & ~1u;
+            ctx.jit->ClearHalt(HR::UserDefined1 | HR::Step);
+            hr = ctx.jit->Step();
+            if (Dynarmic::Has(hr, HR::CacheInvalidation)) { ctx.jit->ClearHalt(HR::CacheInvalidation); hr &= ~HR::CacheInvalidation; }
+            if (hr != Dynarmic::HaltReason{}) break;
+            if (pc_in_sentinel((uint32_t)ctx.jit->Regs()[15])) break;
+            if (cb.ticks >= max_ticks) break;
+            if ((++stotal % 2'000'000ull) == 0)
+                fprintf(stderr, "[stepa] %llu steps, ticks=%llu pc=0x%08x\n",
+                        (unsigned long long)stotal, (unsigned long long)cb.ticks,
+                        (uint32_t)ctx.jit->Regs()[15] & ~1u);
+            if (stotal > 80'000'000ull) { fprintf(stderr, "[stepa] step cap reached\n"); break; }
+            continue;
+        }
         hr = ctx.jit->Run();
         /* CacheInvalidation is raised when InvalidateCacheRange() is called from
          * within a SVC handler while the JIT is mid-Run (e.g. cacheflush after
@@ -13051,7 +14597,12 @@ static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
             hr &= ~HR::CacheInvalidation;
         }
         cb.periodic_yield = false;                           /* consumed the yield */
-        if (hr != Dynarmic::HaltReason{}) break;            /* fault/yield/step */
+        if (hr != Dynarmic::HaltReason{}) {
+            /* AddTicks STEP_AFTER halt: resume into single-step mode below. */
+            if (g_stepa_requested || (step_after && cb.ticks >= step_after))
+                continue;
+            break;                                            /* fault/yield/step */
+        }
         if (pc_in_sentinel(ctx.jit->Regs()[15])) break;     /* guest returned  */
         if (cb.ticks >= max_ticks) break;                    /* tick budget hit */
         /* Heartbeat: print progress when running unlimited (e.g. nativeRender
@@ -13077,11 +14628,62 @@ static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
                 schedule_threads(env_ticks("LUNARIA_THREAD_TICKS", 200'000'000ULL));
         }
     }
+after_run_loop:;
     /* LUNARIA_WATCH precise capture: the first wild-store hit arms g_step_mode, records
      * the clobbered word (g_watch_poll_addr) and halts.  We then single-step and
      * poll that word *between* steps — at a step boundary R[15] is validly written
      * back, so the snapshot taken before the step that flips the word IS the exact
      * faulting instruction.  Continue until capture, sentinel, or tick limit. */
+    if (g_steptrace_armed) {
+        fprintf(stderr, "[steptrace] armed at pc=0x%08x — single-stepping to null\n",
+                (uint32_t)ctx.jit->Regs()[15] & ~1u);
+        uint32_t prevpc = 0;
+        for (uint64_t s = 0; s < 200000ull; ++s) {
+            auto &R = ctx.jit->Regs();
+            uint32_t pc = (uint32_t)R[15];
+            if ((pc & ~1u) < 0x1000u) {
+                fprintf(stderr, "[steptrace] JUMP TO NULL after pc=0x%08x "
+                        "r0=%08x r1=%08x r2=%08x r3=%08x lr=%08x sp=%08x\n",
+                        prevpc, (uint32_t)R[0], (uint32_t)R[1], (uint32_t)R[2],
+                        (uint32_t)R[3], (uint32_t)R[14], (uint32_t)R[13]);
+                g_steptrace_trigger = 0;   /* found it — stop re-arming */
+                break;
+            }
+            prevpc = pc & ~1u;
+            if (s < 4000)
+                fprintf(stderr, "[st] %08x\n", prevpc);
+            /* Dump full regs + vtable chain at the known vcall sites so the NULL
+             * slot's owning object/vtable is visible pre-crash. */
+            if (const char *dpc = getenv("LUNARIA_STEP_DUMP_PC")) {
+                uint32_t want = (uint32_t)strtoul(dpc, nullptr, 16) & ~1u;
+                if (prevpc == want) {
+                    fprintf(stderr, "[stdump] pc=0x%08x", prevpc);
+                    for (int i = 0; i < 13; ++i) fprintf(stderr, " r%d=%08x", i, (uint32_t)R[i]);
+                    fprintf(stderr, " lr=%08x sp=%08x\n", (uint32_t)R[14], (uint32_t)R[13]);
+                    uint32_t r6v = (uint32_t)R[6];
+                    if (ctx.mem.ptr(r6v)) {
+                        uint32_t o = ctx.mem.read32(r6v + 4);
+                        fprintf(stderr, "[stdump] r6=0x%08x [r6+4]=0x%08x\n", r6v, o);
+                        if (o && ctx.mem.ptr(o)) {
+                            uint32_t vt = ctx.mem.read32(o);
+                            fprintf(stderr, "[stdump] obj=0x%08x vtable=0x%08x\n", o, vt);
+                            if (vt && ctx.mem.ptr(vt))
+                                for (int k = 0x30; k <= 0x3c; k += 4)
+                                    fprintf(stderr, "[stdump]   vtable[+0x%02x]=0x%08x\n", k,
+                                            ctx.mem.read32(vt + k));
+                        }
+                    }
+                }
+            }
+            ctx.jit->ClearHalt(HR::UserDefined1 | HR::Step);
+            hr = ctx.jit->Step();
+            if (pc_in_sentinel((uint32_t)ctx.jit->Regs()[15])) {
+                /* benign return; leave trigger armed for the next (crashing) call */
+                break;
+            }
+        }
+        g_steptrace_armed = false;
+    }
     if (g_step_mode && !g_step_capture_done) {
         uint32_t prev = ctx.mem.read32(g_watch_poll_addr);
         for (uint64_t steps = 0;
@@ -13099,6 +14701,26 @@ static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
             ctx.jit->ClearHalt(HR::UserDefined1 | HR::Step);
             hr = ctx.jit->Step();
 
+            /* LUNARIA_WATCH_TO_NULL: after the first store hit, keep stepping and
+             * log the exact instruction stream into a jump-to-null. */
+            if (getenv("LUNARIA_WATCH_TO_NULL")) {
+                static uint32_t nr[128]; static uint32_t nrp = 0; static bool started=false;
+                if (!started) { started=true;
+                    fprintf(stderr, "[w2null] armed at store, stepping from pc=0x%08x\n", snap[15]&~1u); }
+                uint32_t pc2 = (uint32_t)ctx.jit->Regs()[15];
+                nr[nrp++ & 127] = snap[15] & ~1u;
+                if ((pc2 & ~1u) < 0x1000u) {
+                    auto &Rn = ctx.jit->Regs();
+                    fprintf(stderr, "[w2null] JUMP-TO-NULL. last insns (newest last):\n");
+                    for (int i=0;i<128;++i){ uint32_t q=nr[(nrp-128+i)&127]; if(q) fprintf(stderr," %08x",q); if((i&15)==15)fprintf(stderr,"\n"); }
+                    fprintf(stderr, "[w2null] regs: r0=%08x r1=%08x r2=%08x r3=%08x lr=%08x sp=%08x\n",
+                            (uint32_t)Rn[0],(uint32_t)Rn[1],(uint32_t)Rn[2],(uint32_t)Rn[3],(uint32_t)Rn[14],(uint32_t)Rn[13]);
+                    g_watch_lo=g_watch_hi=0; g_step_capture_done=true; break;
+                }
+                if (steps > 3'000'000ull) { fprintf(stderr,"[w2null] cap\n"); g_step_capture_done=true; break; }
+                prev = ctx.mem.read32(g_watch_poll_addr);
+                continue;
+            }
             uint32_t now = ctx.mem.read32(g_watch_poll_addr);
             if (now != prev) {
                 uint32_t instr_pc = snap[15] & ~1u;
@@ -13139,7 +14761,15 @@ static int run_arm(ArmExecCtx &ctx, uint32_t entry_va,
     ctx.regs_valid = true;
 
     bool timed_out = (cb.ticks >= max_ticks);
-    int ret=(int)ctx.jit->Regs()[0];
+    /* A call that ends via a genuine fault (NoExecuteFault, MemoryAbort, …)
+     * without reaching the sentinel return address never executed its own
+     * "mov r0, <retval>" epilogue — R0 is whatever garbage was left by the
+     * interrupted code, not a real return value.  Callers that treat the
+     * result as a success/failure boolean (e.g. loader.c's nativeRender
+     * loop) need a reliable 0 here so their fault-recovery path actually
+     * triggers instead of misreading leftover R0 as success. */
+    bool reached_sentinel = pc_in_sentinel(ctx.jit->Regs()[15]);
+    int ret = reached_sentinel ? (int)ctx.jit->Regs()[0] : 0;
     if (timed_out)
         fprintf(stderr,"[arm_exec] run_arm: TIMEOUT after %llu ticks, last_svc=%u, pc=0x%08x\n",
                 (unsigned long long)cb.ticks, cb.last_svc,
@@ -13413,13 +15043,32 @@ extern "C" void arm_exec_ensure_mono_trampolines(void) {
     static bool done = false;
     if (done || !g_ctx || !g_mono_base) return;
 
-    /* mono_trampoline_init fills mono_trampoline_code[0..11] only. */
-    if (uint32_t tramp_init = mono_fn_va(nullptr, 0xf0b04u)) {
-        (void)run_arm(*g_ctx, tramp_init, 0, 0, 0, 0,
-                      env_ticks("LUNARIA_JITINIT_TICKS", 500'000'000ULL));
-        arm_exec_run_pending_threads();
+    ensure_mono_icall_hashes(*g_ctx);
+
+    const uint32_t tc = mono_sym_va("mono_trampoline_code");
+    const uint32_t get_tf = mono_sym_va("mono_get_trampoline_func");
+    if (!tc || !get_tf) {
+        fprintf(stderr, "[arm_exec] ensure_mono_trampolines: missing export (tc=%#x get=%#x)\n",
+                tc, get_tf);
+        done = true;
+        return;
     }
-    fprintf(stderr, "[arm_exec] ensure_mono_trampolines: ready\n");
+
+    unsigned filled = 0;
+    for (uint32_t t = 0; t < 12u; ++t) {
+        if (g_ctx->mem.read32(tc + t * 4u)) {
+            ++filled;
+            continue;
+        }
+        const uint32_t addr = (uint32_t)run_arm(*g_ctx, get_tf, t, 0, 0, 0,
+                                                env_ticks("LUNARIA_JITINIT_TICKS", 500'000'000ULL));
+        arm_exec_run_pending_threads();
+        if (addr) {
+            g_ctx->mem.write32(tc + t * 4u, addr);
+            ++filled;
+        }
+    }
+    fprintf(stderr, "[arm_exec] ensure_mono_trampolines: ready (%u/12 slots)\n", filled);
     done = true;
 }
 
@@ -13522,6 +15171,10 @@ extern "C" void arm_exec_write32(uint32_t va, uint32_t val) {
 /* Bytes of guest heap consumed by the bump allocator (excludes freelist reuse). */
 extern "C" uint32_t arm_exec_heap_used(void) {
     return g_ctx ? (g_ctx->heap_ptr - HEAP_BASE) : 0u;
+}
+
+extern "C" uint64_t arm_exec_guest_abort_count(void) {
+    return g_guest_abort_count;
 }
 
 extern "C" const char *arm_exec_get_main_lib_dir(void) {

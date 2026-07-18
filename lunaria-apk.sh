@@ -102,6 +102,60 @@ unzip "$1" -d "$tmpdir"
 # Also needs mono/config in the mono/ directory.
 # Create symlinks so Mono finds everything via the extracted dir.
 managed_dir="$tmpdir/assets/bin/Data/Managed"
+
+# Unity Android splits assets >1MB into name.split0..N inside the APK.  The
+# player concatenates them at runtime; our fopen/ZIP path only opens split0 and
+# then seeks past EOF → "Position out of bounds" / multi-GB texture OOM.
+# Materialise the logical files in the extract tree and rebuild a STORE APK so
+# both the filesystem VFS and ArchiveFileSystem see a single asset.
+python3 - "$tmpdir" <<'PYEOF'
+import os, sys
+root = sys.argv[1]
+joined = 0
+for dirpath, _, files in os.walk(root):
+    splits = [f for f in files if ".split" in f]
+    # Group by base name: foo.assets.split0 → foo.assets
+    bases = {}
+    for f in splits:
+        idx = f.rfind(".split")
+        if idx < 0:
+            continue
+        suf = f[idx + 6:]
+        if not suf.isdigit():
+            continue
+        bases.setdefault(f[:idx], []).append((int(suf), f))
+    for base, parts in bases.items():
+        parts.sort(key=lambda x: x[0])
+        out = os.path.join(dirpath, base)
+        # Skip if a complete base already exists and is larger than split0
+        if os.path.isfile(out) and os.path.getsize(out) > 0:
+            # Still remove splits so Unity does not prefer the split reader
+            for _, f in parts:
+                try: os.remove(os.path.join(dirpath, f))
+                except OSError: pass
+            continue
+        with open(out, "wb") as wf:
+            for _, f in parts:
+                p = os.path.join(dirpath, f)
+                with open(p, "rb") as rf:
+                    while True:
+                        chunk = rf.read(1 << 20)
+                        if not chunk:
+                            break
+                        wf.write(chunk)
+                os.remove(p)
+        joined += 1
+        print(f"[lunaria-apk] joined {len(parts)} splits → {os.path.relpath(out, root)}",
+              file=sys.stderr)
+print(f"[lunaria-apk] joined {joined} split asset(s)", file=sys.stderr)
+PYEOF
+
+# Repack extract tree as STORE APK so Unity's ZIP ArchiveFileSystem also sees
+# the joined assets (original APK still has DEFLATE'd .splitN entries only).
+repacked="$tmpdir/lunaria-joined.apk"
+( cd "$tmpdir" && zip -0 -q -r "$repacked" . -x "lunaria-joined.apk" ) || err "repack apk failed"
+export ANDROID_APK_FILE="$repacked"
+
 if [ -d "$managed_dir" ]; then
     # Mono's mono_assembly_load_corlib() searches for corlib at
     #   <assembly_rootdir>/mono/<framework_version>/mscorlib.dll
@@ -128,10 +182,18 @@ fi
 
 export ANDROID_PACKAGE_CODE_PATH="$tmpdir"
 export ANDROID_PACKAGE_NAME="$pkgname"
-# Unity の nativeFile へ渡す実 APK ファイル。Android 実機では
-# getPackageCodePath() が APK ファイルを返し、Unity はそれを ZIP として
-# マウントする。展開ディレクトリは AssetManager ブリッジ/Mono 用に維持。
-export ANDROID_APK_FILE="$pkgfile"
+# Unity の nativeFile へ渡す実 APK ファイル。上で split 結合済みの
+# lunaria-joined.apk を優先（元 APK は ANDROID 用参照として残さない）。
+# 展開ディレクトリは AssetManager ブリッジ/Mono 用に維持。
+if [ -z "$ANDROID_APK_FILE" ] || [ ! -f "$ANDROID_APK_FILE" ]; then
+    export ANDROID_APK_FILE="$pkgfile"
+fi
+
+# persistentDataPath / getExternalFilesDir
+export ANDROID_EXTERNAL_FILES_DIR="$tmpdir/local/files"
+mkdir -p "$ANDROID_EXTERNAL_FILES_DIR"
+export ANDROID_EXTERNAL_OBB_DIR="$PWD/local/data/$pkgname/obb"
+mkdir -p "$ANDROID_EXTERNAL_OBB_DIR"
 
 # Mono assembly search path: without this, mono_assembly_load_corlib's
 # load_in_path() iterates over an empty search list and returns NULL with
@@ -145,10 +207,6 @@ if [ -d "$managed_dir" ]; then
     export MONO_CFG_DIR="$mono_cfg"
     export MONO_CONFIG="$mono_cfg/mono/config"
 fi
-
-# TODO: when we have first release, make this follow XDG spec
-export ANDROID_EXTERNAL_FILES_DIR="$PWD/local/data/$pkgname/files"
-export ANDROID_EXTERNAL_OBB_DIR="$PWD/local/data/$pkgname/obb"
 
 # XXX: We only work with unity stuff for now
 export LD_LIBRARY_PATH="$PWD:$PWD/runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

@@ -141,6 +141,9 @@ void arm_exec_write32(uint32_t va, uint32_t val);
 /* Bytes of guest heap consumed by the bump allocator (for leak diagnosis). */
 uint32_t arm_exec_heap_used(void);
 
+/* How many times guest abort() has been called (mono g_assert, etc.). */
+uint64_t arm_exec_guest_abort_count(void);
+
 /* Return the directory of the main ARM library (set when arm_exec_jni_onload
  * is first called).  Used by libjvm-java.c findLibrary to return full paths. */
 const char *arm_exec_get_main_lib_dir(void);

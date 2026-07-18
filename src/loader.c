@@ -176,10 +176,11 @@ run_jni_game(struct jvm *jvm)
       errx(EXIT_FAILURE, "not a unity jni lib");
 
    const jobject context = jvm->native.AllocObject(&jvm->env, jvm->native.FindClass(&jvm->env, "android/app/Activity"));
-   unity.native_init_jni.fun(&jvm->env, context, context);
 
    if (unity.native_file.ptr) {
-      unity.native_file.fun(&jvm->env, context, jvm->env->NewStringUTF(&jvm->env, getenv("ANDROID_PACKAGE_CODE_PATH")));
+      const char *apk = lunaria_apk_mount_path();
+      if (apk && *apk)
+         unity.native_file.fun(&jvm->env, context, jvm->env->NewStringUTF(&jvm->env, apk));
 
       DIR *dir;
       const char *obb_dir = getenv("ANDROID_EXTERNAL_OBB_DIR");
@@ -194,6 +195,8 @@ run_jni_game(struct jvm *jvm)
          }
       }
    }
+
+   unity.native_init_jni.fun(&jvm->env, context, context);
 
    // unity.native_forward_events_to_dalvik.fun(&jvm->env, context, true);
    if (unity.native_init_www.ptr)
@@ -252,16 +255,30 @@ run_jni_game_arm(struct jvm *jvm)
    uint32_t env = arm_exec_env_va();
    const jobject context = jvm->native.AllocObject(&jvm->env, jvm->native.FindClass(&jvm->env, "android/app/Activity"));
    uint32_t ctx = (uint32_t)(uintptr_t)context;
-
-   /* libmono.so is preloaded at 0x20000000; log root domain via export lookup. */
    uint32_t mono_root = mono_export_call("mono_get_root_domain");
-   fprintf(stderr, "[loader] calling initJni (va=0x%08x) mono_root_domain=0x%08x...\n",
-           va_init_jni, mono_root);
 
    /* JIT trampolines must exist before initJni — Unity 4.x maps mscorlib inside
     * initJni, and mono branches into uninitialized codeman slots without mini_init. */
    arm_exec_ensure_mono_trampolines();
    dump_mono_defaults("after mono trampolines");
+
+   /* Mount the APK before initJni.  On a real device UnityPlayer passes
+    * getPackageCodePath() (the .apk file) via nativeFile during construction,
+    * before initJni reads assets/bin/Data.  Calling nativeFile after initJni
+    * leaves ArchiveFileSystem unmounted and splash upload runs with unset
+    * texture callbacks. */
+   if (va_file) {
+      const char *apk = lunaria_apk_mount_path();
+      if (apk && *apk) {
+         fprintf(stderr, "[loader] calling nativeFile (%s)...\n", apk);
+         jobject str = jvm->native.NewStringUTF(&jvm->env, apk);
+         arm_exec_call(va_file, env, ctx, (uint32_t)(uintptr_t)str, 0);
+         arm_exec_run_pending_threads();
+      }
+   }
+
+   fprintf(stderr, "[loader] calling initJni (va=0x%08x) mono_root_domain=0x%08x...\n",
+           va_init_jni, mono_root);
 
    arm_exec_call(va_init_jni, env, ctx, ctx, 0);
    arm_exec_run_pending_threads();
@@ -276,20 +293,6 @@ run_jni_game_arm(struct jvm *jvm)
 
    /* mono_file_map_open/… are hooked via SVC; leave Unity's override from initJni
     * unless it blocks our hooks (cleared on libunity load if needed). */
-
-   /* nativeFile: Android 実機では getPackageCodePath() の「APK ファイル」が
-    * 渡され、Unity はそれを ZIP アーカイブとしてマウントする。展開ディレクトリ
-    * を渡すと ZIP 署名チェックに失敗してマウントされず、ArchiveFileSystem 経由
-    * の相対パス (assets/bin/Data/splash.png 等) が NULL を返す。実 APK パス
-    * (ANDROID_APK_FILE) を優先して渡す。 */
-   if (va_file) {
-      const char *apk = getenv("ANDROID_APK_FILE");
-      if (!apk) apk = getenv("ANDROID_PACKAGE_CODE_PATH");
-      if (apk) {
-         jobject str = jvm->native.NewStringUTF(&jvm->env, apk);
-         arm_exec_call(va_file, env, ctx, (uint32_t)(uintptr_t)str, 0);
-      }
-   }
 
    /* EGL は main() の arm_exec_jni_onload より前に初期化済み。
     * 念のため再度 make-current を試みる（arm_exec_host_egl_init は冪等）。 */
@@ -351,7 +354,17 @@ run_jni_game_arm(struct jvm *jvm)
    /* limp mode: nativeRender が失敗(0)を返してもループを続ける。
     * スタブ未実装による一過性の失敗後も他のサブシステムは前進し得る。 */
    int frame_count = 0, fail_streak = 0, last_ok = -1, resized_after_init = 0;
+   int max_frames = 0;
+   {
+      const char *mf = getenv("LUNARIA_MAX_FRAMES");
+      if (mf && *mf) max_frames = atoi(mf);
+   }
    for (;;) {
+      if (max_frames > 0 && frame_count >= max_frames) {
+         fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached — exiting render loop\n",
+                 max_frames);
+         break;
+      }
       /* LUNARIA_TOUCH_TEST=x,y: フレーム 300 で DOWN、310 で UP を自動注入
        * (X11 フォーカスに依存しないタップ検証用) */
       {
@@ -399,6 +412,14 @@ run_jni_game_arm(struct jvm *jvm)
        * "PlayerLoop called recursively!".  Use the unlimited variant. */
       arm_exec_drain_gl_thread_jobs();
       int ok = arm_exec_call_unlimited(va_render, env, ctx, 0, 0);
+      /* Guest abort() (e.g. mono g_assert after mmap OOM) leaves PlayerLoop
+       * inconsistent; clearing a hardcoded guard VA then re-entering floods
+       * "PlayerLoop called recursively".  Stop the loop after the first abort. */
+      if (arm_exec_guest_abort_count() > 0) {
+         fprintf(stderr, "[loader] guest abort seen — stopping render loop (frame %d)\n",
+                 frame_count);
+         break;
+      }
       /* If nativeRender was cut short by a guest fault (NULL call, NoExecuteFault),
        * PlayerLoop's re-entry guard byte at 0x20f1ac90 may still be set to 1,
        * causing every subsequent frame to bail with "PlayerLoop called recursively!".
