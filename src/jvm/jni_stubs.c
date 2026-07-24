@@ -20,10 +20,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include "jvm/jni.h"
 #include "jvm.h"
+#include "arm_exec.h"
+#include "guest_mem.h"
 
 extern void arm_exec_drain_gl_thread_jobs(void);
 const char *arm_exec_get_main_lib_dir(void);
@@ -331,6 +334,27 @@ java_lang_ClassLoader_findClass(JNIEnv *env, jobject object, va_list args)
    return (*env)->FindClass(env, utf);
 }
 
+/* ClassLoader.loadClass(name) — same as findClass for our stub JVM.
+ * libgpg's DexClassLoader.loadClass must not fall through to a NULL wrapper
+ * call (host SIGSEGV); map the name onto FindClass so GMS class handles exist. */
+jobject
+java_lang_ClassLoader_loadClass(JNIEnv *env, jobject object, va_list args)
+{
+   return java_lang_ClassLoader_findClass(env, object, args);
+}
+
+jobject
+dalvik_system_DexClassLoader_loadClass(JNIEnv *env, jobject object, va_list args)
+{
+   return java_lang_ClassLoader_findClass(env, object, args);
+}
+
+jobject
+dalvik_system_BaseDexClassLoader_loadClass(JNIEnv *env, jobject object, va_list args)
+{
+   return java_lang_ClassLoader_findClass(env, object, args);
+}
+
 jobject
 java_lang_Class_getClassLoader(JNIEnv *env, jobject object)
 {
@@ -430,11 +454,34 @@ java_lang_String_getBytes(JNIEnv *env, jobject object, va_list args)
    return bytes;
 }
 
+jobject
+java_util_Locale_getDefault(JNIEnv *env, jclass clazz)
+{
+   assert(env);
+   static jobject sv;
+   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/util/Locale"))));
+}
+
 jstring
 java_util_Locale_getLanguage(JNIEnv *env, jobject object)
 {
-   assert(env && object);
+   assert(env);
+   if (!object) return (*env)->NewStringUTF(env, "en");
    return (*env)->NewStringUTF(env, "en");
+}
+
+jstring
+java_util_Locale_toString(JNIEnv *env, jobject object)
+{
+   assert(env);
+   return (*env)->NewStringUTF(env, "en_US");
+}
+
+jstring
+java_util_Locale_toLanguageTag(JNIEnv *env, jobject object)
+{
+   assert(env);
+   return (*env)->NewStringUTF(env, "en-US");
 }
 
 jstring
@@ -760,16 +807,67 @@ jobject
 android_content_Context_getCacheDir(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
+   (void)args;
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"))));
+   if (!sv) {
+      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
+      /* libgpg extracts an embedded classes jar under cacheDir; a File
+       * without a path made "Error emptying previous jar directory". */
+      const char *p = getenv("ANDROID_CACHE_DIR");
+      jni_file_set_path(sv, (p && *p) ? p : "/tmp/lunaria-cache");
+      mkdir("/tmp/lunaria-cache", 0755);
+   }
+   return sv;
 }
 
 jobject
 android_content_Context_getExternalCacheDir(JNIEnv *env, jobject object, va_list args)
 {
    assert(env && object);
+   (void)args;
    static jobject sv;
-   return (sv ? sv : (sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"))));
+   if (!sv) {
+      sv = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
+      const char *p = getenv("ANDROID_EXTERNAL_CACHE_DIR");
+      jni_file_set_path(sv, (p && *p) ? p : "/tmp/lunaria-ext-cache");
+      mkdir("/tmp/lunaria-ext-cache", 0755);
+   }
+   return sv;
+}
+
+/* Context.getDir(name, mode) → File for app_<name> under the files dir.
+ * libgpg uses getDir(".gpg.classloader", MODE_PRIVATE) to extract an embedded
+ * classes jar; returning NULL made "Error emptying previous jar directory".
+ * Prefer the arm_exec CallObjectMethod special-case (passes name); this stub
+ * covers host-side calls that supply a real va_list. */
+jobject
+android_content_Context_getDir(JNIEnv *env, jobject object, va_list args)
+{
+   assert(env && object);
+   char namebuf[256];
+   snprintf(namebuf, sizeof namebuf, "%s", "dir");
+   jstring js = NULL;
+   if (args) {
+      js = va_arg(args, jstring);
+      (void)va_arg(args, jint); /* mode */
+      if (js) {
+         const char *utf = (*env)->GetStringUTFChars(env, js, NULL);
+         if (utf && *utf)
+            snprintf(namebuf, sizeof namebuf, "%s", utf);
+         if (utf)
+            (*env)->ReleaseStringUTFChars(env, js, utf);
+      }
+   }
+   const char *base = getenv("ANDROID_FILES_DIR");
+   if (!base || !*base)
+      base = "/tmp/lunaria-files";
+   mkdir(base, 0755);
+   char path[PATH_MAX];
+   snprintf(path, sizeof path, "%s/app_%s", base, namebuf);
+   mkdir(path, 0755);
+   jobject file = (*env)->AllocObject(env, (*env)->FindClass(env, "java/io/File"));
+   jni_file_set_path(file, path);
+   return file;
 }
 
 jstring
@@ -939,6 +1037,29 @@ android_view_MotionEvent_getSource(JNIEnv *env, jobject object, va_list args)
    return 0x00001002; // SOURCE_TOUCHSCREEN
 }
 
+/* Unity 5.x nativeInjectEvent copies the event via
+ * MotionEvent.obtain(MotionEvent) before queuing.  Without this static
+ * method CallStaticObjectMethodV returns null and inject bails with false
+ * (~6k insns, no getAction/getX).  Getters read arm_exec_touch_*, so a
+ * fresh stub object is enough. */
+jobject
+android_view_MotionEvent_obtain(JNIEnv *env, jclass clazz, va_list args)
+{
+   assert(env && clazz);
+   motion_trace("obtain");
+   (void)args;
+   return (*env)->AllocObject(env,
+         (*env)->FindClass(env, "android/view/MotionEvent"));
+}
+
+void
+android_view_MotionEvent_recycle(JNIEnv *env, jobject object, va_list args)
+{
+   assert(env && object);
+   motion_trace("recycle");
+   (void)args;
+}
+
 /* MotionEvent getters read the current touch event captured from the GLFW
  * mouse by arm_exec.cpp (see arm_exec_touch_* in arm_exec.h).  The loader
  * pops one event per arm_exec_touch_next() and injects it via
@@ -1085,14 +1206,14 @@ jint
 android_util_DisplayMetrics_widthPixels(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   return 1280;
+   return arm_exec_fb_width();
 }
 
 jint
 android_util_DisplayMetrics_heightPixels(JNIEnv *env, jobject object)
 {
    assert(env && object);
-   return 720;
+   return arm_exec_fb_height();
 }
 
 /* ---------------------------------------------------------------------------
@@ -1708,6 +1829,24 @@ jobject java_lang_Object_getSystemService(JNIEnv *env, jobject obj, va_list args
 jobject java_lang_Class_getSystemService(JNIEnv *env, jobject obj, va_list args)
 { return android_content_Context_getSystemService(env, obj, args); }
 
+jobject android_content_Context_getDir(JNIEnv *env, jobject obj, va_list args);
+jobject android_app_Activity_getDir(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_getDir(env, obj, args); }
+jobject com_unity3d_player_UnityPlayer_getDir(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_getDir(env, obj, args); }
+jobject java_lang_Object_getDir(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_getDir(env, obj, args); }
+jobject java_lang_Class_getDir(JNIEnv *env, jobject obj, va_list args)
+{ return android_content_Context_getDir(env, obj, args); }
+
+jobject java_lang_Class_getClassLoader(JNIEnv *env, jobject object);
+jobject android_content_Context_getClassLoader(JNIEnv *env, jobject obj, va_list args)
+{ (void)args; return java_lang_Class_getClassLoader(env, obj); }
+jobject android_app_Activity_getClassLoader(JNIEnv *env, jobject obj, va_list args)
+{ (void)args; return java_lang_Class_getClassLoader(env, obj); }
+jobject com_unity3d_player_UnityPlayer_getClassLoader(JNIEnv *env, jobject obj, va_list args)
+{ (void)args; return java_lang_Class_getClassLoader(env, obj); }
+
 /* ActivityManager.MemoryInfo.lowMemory — public boolean field read by Unity to
  * decide whether to trigger aggressive GC.  In headless emulation report false
  * so the engine takes its normal (non-low-memory) code path. */
@@ -1719,56 +1858,32 @@ jboolean java_lang_Class_lowMemory(JNIEnv *env, jobject obj)
 { (void)env; (void)obj; return 0; }
 
 /* ActivityManager.getMemoryInfo(ActivityManager.MemoryInfo outInfo) — void method.
- * Unity queries this to decide how aggressively to trim the asset cache and
- * whether to trigger a GC pass.  We populate outInfo's fields with a fixed
- * 32-bit guest memory profile consistent with the synthetic /proc/meminfo —
- * NOT the host's figures, which would leak a desktop's tens-of-GB totalram and
- * cache-driven freeram dips into the engine's heuristics:
+ * Unity queries this to size Dynamic Heap / trim caches.  Profile comes from
+ * guest_mem.h (LUNARIA_MEM_TOTAL_MB default 6144 = 6 GiB phone-class), kept in
+ * sync with synthetic /proc/meminfo — never the host sysinfo().
  *
- *   availMem  — ~1.7 GB (matches /proc/meminfo MemAvailable)
- *   totalMem  — 2 GB     (matches /proc/meminfo MemTotal)
- *   lowMemory — true when availMem < threshold (always false here)
- *   threshold — 48 MB: below this Unity starts releasing cached assets
- *
- * Field IDs are looked up once and cached. If the JNI FindClass/GetFieldID
- * calls fail (which they won't in normal operation) we fall back to a no-op so
- * the engine at least doesn't crash. */
+ * Field IDs are looked up once and cached. */
 void
 android_app_ActivityManager_getMemoryInfo(JNIEnv *env, jobject obj, va_list args)
 {
    (void)obj;
 
-   /* Consume the MemoryInfo outInfo argument if present. */
    jobject out_info = NULL;
    if (args)
       out_info = va_arg(args, jobject);
    if (!out_info)
       return;
 
-   /* Report a fixed 32-bit guest memory profile, NOT the host's figures.
-    * The host sysinfo(2) is doubly wrong here: on a desktop it reports tens of
-    * GB of totalram (Unity's MemoryManager then sizes its heaps far past the
-    * 4 GB guest arena until arm_malloc() throws bad_alloc), while freeram can
-    * momentarily dip below the low-memory threshold because of filesystem
-    * caches (Unity then aggressively releases assets mid-load).  These figures
-    * must also stay consistent with the synthetic /proc/meminfo the emulator
-    * hands the Boehm GC (2 GB total / ~1.7 GB available); otherwise the two
-    * memory oracles disagree and the engine's trim heuristics oscillate. */
-   static const jlong TOTAL_BYTES = 2048L * 1024 * 1024; /* 2 GB, matches /proc/meminfo MemTotal */
-   static const jlong AVAIL_BYTES = 1728L * 1024 * 1024; /* ~1.7 GB, matches MemAvailable */
-   jlong total_bytes = TOTAL_BYTES;
-   jlong avail_bytes = AVAIL_BYTES;
+   jlong total_bytes = (jlong)lunaria_mem_total_bytes();
+   jlong avail_bytes = (jlong)lunaria_mem_avail_bytes();
+   jlong threshold   = (jlong)lunaria_mem_threshold_bytes();
+   jboolean low = (avail_bytes < threshold) ? JNI_TRUE : JNI_FALSE;
 
-   /* 48 MB low-memory threshold — matches the default Android Go threshold. */
-   static const jlong THRESHOLD = 48L * 1024 * 1024;
-   jboolean low = (avail_bytes < THRESHOLD) ? JNI_TRUE : JNI_FALSE;
-
-   /* Cache field IDs across calls (the class object is stable for the process
-    * lifetime, so storing the IDs in statics is safe). */
    static jfieldID fid_avail   = NULL;
    static jfieldID fid_total   = NULL;
    static jfieldID fid_low     = NULL;
    static jfieldID fid_thresh  = NULL;
+   static int logged = 0;
 
    if (!fid_avail) {
       jclass cls = (*env)->FindClass(env, "android/app/ActivityManager$MemoryInfo");
@@ -1780,10 +1895,18 @@ android_app_ActivityManager_getMemoryInfo(JNIEnv *env, jobject obj, va_list args
       if (!fid_avail || !fid_total || !fid_low || !fid_thresh) return;
    }
 
+   if (!logged) {
+      logged = 1;
+      fprintf(stderr, "[mem] getMemoryInfo total=%ldMB avail=%ldMB threshold=%ldMB "
+              "(LUNARIA_MEM_TOTAL_MB / LUNARIA_MEM_AVAIL_MB)\n",
+              (long)(total_bytes >> 20), (long)(avail_bytes >> 20),
+              (long)(threshold >> 20));
+   }
+
    (*env)->SetLongField   (env, out_info, fid_avail,  avail_bytes);
    (*env)->SetLongField   (env, out_info, fid_total,  total_bytes);
    (*env)->SetBooleanField(env, out_info, fid_low,    low);
-   (*env)->SetLongField   (env, out_info, fid_thresh, THRESHOLD);
+   (*env)->SetLongField   (env, out_info, fid_thresh, threshold);
 }
 
 /* Bridge alias: the JVM bridge resolves by prepending the runtime class name.
@@ -1834,6 +1957,17 @@ void java_lang_Object_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
 { (void)e; (void)o; (void)a; }
 void java_lang_Class_setRequestedOrientation(JNIEnv *e, jobject o, va_list a)
 { (void)e; (void)o; (void)a; }
+
+/* Activity.getRequestedOrientation() — Time Locker manifest uses
+ * screenOrientation=sensorPortrait (7).  Without a stub CallIntMethod
+ * returns 0 (LANDSCAPE), which can skew Unity's Screen.orientation /
+ * camera setup relative to our portrait FB. */
+jint android_app_Activity_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return 7; /* SCREEN_ORIENTATION_SENSOR_PORTRAIT */ }
+jint java_lang_Object_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return 7; }
+jint java_lang_Class_getRequestedOrientation(JNIEnv *e, jobject o, va_list a)
+{ (void)e; (void)o; (void)a; return 7; }
 
 /* ---- android.os.Build string fields ---- */
 jstring android_os_Build_DEVICE(JNIEnv *e, jobject o)
@@ -1976,18 +2110,18 @@ jint java_lang_Class_getDisplayId(JNIEnv *e, jobject o, va_list a)
 { (void)e; (void)o; (void)a; return 0; }
 
 jint android_view_Display_getWidth(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 1280; }
+{ (void)e; (void)o; (void)a; return arm_exec_fb_width(); }
 jint java_lang_Object_getWidth(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 1280; }
+{ (void)e; (void)o; (void)a; return arm_exec_fb_width(); }
 jint java_lang_Class_getWidth(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 1280; }
+{ (void)e; (void)o; (void)a; return arm_exec_fb_width(); }
 
 jint android_view_Display_getHeight(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 720; }
+{ (void)e; (void)o; (void)a; return arm_exec_fb_height(); }
 jint java_lang_Object_getHeight(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 720; }
+{ (void)e; (void)o; (void)a; return arm_exec_fb_height(); }
 jint java_lang_Class_getHeight(JNIEnv *e, jobject o, va_list a)
-{ (void)e; (void)o; (void)a; return 720; }
+{ (void)e; (void)o; (void)a; return arm_exec_fb_height(); }
 
 jint android_view_Display_getRotation(JNIEnv *e, jobject o, va_list a)
 { (void)e; (void)o; (void)a; return 0; } /* ROTATION_0 */
@@ -1998,34 +2132,58 @@ jint java_lang_Class_getRotation(JNIEnv *e, jobject o, va_list a)
 
 /* Display.getRealMetrics(DisplayMetrics outMetrics) — populate w/h/density.
  * Unity reads widthPixels/heightPixels/xdpi/ydpi/density from the outMetrics
- * object to set up its screen metrics. */
+ * object to set up its screen metrics.  CallVoidMethod from the ARM bridge
+ * often passes a NULL args pointer, so arm_exec also calls this helper with
+ * the outMetrics jobject read from guest registers. */
+void
+android_view_Display_fillMetrics(JNIEnv *e, jobject out)
+{
+   if (!e || !out) return;
+   jclass cls = (*e)->FindClass(e, "android/util/DisplayMetrics");
+   if (!cls) return;
+   int w = arm_exec_fb_width(), h = arm_exec_fb_height();
+   /* mdpi (1.0): Time Locker's world-space START/tutorial quads were vertically
+    * crushed at density=2.0 (layout in 360dp while meshes assume full pixels). */
+   float density = 1.0f;
+   float dpi = 160.0f * density;
+   jfieldID fw = (*e)->GetFieldID(e, cls, "widthPixels",   "I");
+   jfieldID fh = (*e)->GetFieldID(e, cls, "heightPixels",  "I");
+   jfieldID fd = (*e)->GetFieldID(e, cls, "density",       "F");
+   jfieldID fs = (*e)->GetFieldID(e, cls, "scaledDensity", "F");
+   jfieldID fx = (*e)->GetFieldID(e, cls, "xdpi",          "F");
+   jfieldID fy = (*e)->GetFieldID(e, cls, "ydpi",          "F");
+   jfieldID fi = (*e)->GetFieldID(e, cls, "densityDpi",    "I");
+   if (fw) (*e)->SetIntField(e, out, fw, w);
+   if (fh) (*e)->SetIntField(e, out, fh, h);
+   if (fd) (*e)->SetFloatField(e, out, fd, density);
+   if (fs) (*e)->SetFloatField(e, out, fs, density);
+   if (fx) (*e)->SetFloatField(e, out, fx, dpi);
+   if (fy) (*e)->SetFloatField(e, out, fy, dpi);
+   if (fi) (*e)->SetIntField(e, out, fi, (jint)(dpi + 0.5f));
+   fprintf(stderr, "[arm_jni] DisplayMetrics filled %dx%d density=%.1f\n",
+           w, h, density);
+}
+
 void
 android_view_Display_getRealMetrics(JNIEnv *e, jobject o, va_list a)
 {
    (void)o;
    if (!a) return;
-   jobject out = va_arg(a, jobject);
-   if (!out) return;
-   jclass cls = (*e)->FindClass(e, "android/util/DisplayMetrics");
-   if (!cls) return;
-   jfieldID fw = (*e)->GetFieldID(e, cls, "widthPixels",  "I");
-   jfieldID fh = (*e)->GetFieldID(e, cls, "heightPixels", "I");
-   jfieldID fd = (*e)->GetFieldID(e, cls, "density",      "F");
-   jfieldID fx = (*e)->GetFieldID(e, cls, "xdpi",         "F");
-   jfieldID fy = (*e)->GetFieldID(e, cls, "ydpi",         "F");
-   if (fw) (*e)->SetIntField(e, out, fw, 1280);
-   if (fh) (*e)->SetIntField(e, out, fh, 720);
-   if (fd) (*e)->SetFloatField(e, out, fd, 1.0f);
-   if (fx) (*e)->SetFloatField(e, out, fx, 160.0f);
-   if (fy) (*e)->SetFloatField(e, out, fy, 160.0f);
+   android_view_Display_fillMetrics(e, va_arg(a, jobject));
+}
+void
+android_view_Display_getMetrics(JNIEnv *e, jobject o, va_list a)
+{
+   android_view_Display_getRealMetrics(e, o, a);
 }
 void java_lang_Object_getRealMetrics(JNIEnv *e, jobject o, va_list a)
 { android_view_Display_getRealMetrics(e, o, a); }
 void java_lang_Class_getRealMetrics(JNIEnv *e, jobject o, va_list a)
 { android_view_Display_getRealMetrics(e, o, a); }
-
-
-
+void java_lang_Object_getMetrics(JNIEnv *e, jobject o, va_list a)
+{ android_view_Display_getMetrics(e, o, a); }
+void java_lang_Class_getMetrics(JNIEnv *e, jobject o, va_list a)
+{ android_view_Display_getMetrics(e, o, a); }
 
 jmethodID
 com_unity3d_player_ReflectionHelper_getMethodID(JNIEnv *env, jobject object, jvalue *values)
@@ -2121,12 +2279,23 @@ com_unity3d_player_PlayAssetDeliveryUnityWrapper_playCoreApiMissing(JNIEnv *env,
    return 1;
 }
 
-
+/* Unity IAP: GooglePlayPurchasing.instance(IUnityCallback) — no Play Billing in
+ * the emulator, but returning null makes AndroidJavaObject throw and a later
+ * jproxy Runnable.run blows up mid-nativeRender.  Hand back a singleton stub.
+ * Called via CallStaticObjectMethodA (jvalue*); values may be NULL. */
+jobject
+com_unity_purchasing_googleplay_GooglePlayPurchasing_instance(JNIEnv *env, jclass clazz, jvalue *values)
+{
+   (void)clazz; (void)values;
+   static jobject sv;
+   if (!sv)
+      sv = (*env)->AllocObject(env,
+            (*env)->FindClass(env, "com/unity/purchasing/googleplay/GooglePlayPurchasing"));
+   return sv;
+}
 
 jstring
 com_blizzard_wtcg_hearthstone_DeviceSettings_GetModelNumber(JNIEnv *env, jobject object)
 {
    return (*env)->NewStringUTF(env, "0");
 }
-
-

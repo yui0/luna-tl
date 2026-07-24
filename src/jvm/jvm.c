@@ -874,6 +874,49 @@ gen_jnienv_method(Long, jlong, 0)
 gen_jnienv_method(Float, jfloat, 0)
 gen_jnienv_method(Double, jdouble, 0)
 
+struct jvm_stored_field {
+   struct jvm *jvm;
+   jobject object;
+   jfieldID field;
+   uint64_t bits;
+};
+static struct jvm_stored_field stored_fields[1024];
+static size_t stored_field_count;
+
+static bool
+jvm_get_field_bits(struct jvm *jvm, jobject object, jfieldID field, uint64_t *bits)
+{
+   if (!jvm || !object || !field || !bits)
+      return false;
+   for (size_t i = 0; i < stored_field_count; ++i) {
+      if (stored_fields[i].jvm == jvm && stored_fields[i].object == object &&
+          stored_fields[i].field == field) {
+         *bits = stored_fields[i].bits;
+         return true;
+      }
+   }
+   return false;
+}
+
+static void
+jvm_set_field_bits(struct jvm *jvm, jobject object, jfieldID field, uint64_t bits)
+{
+   if (!jvm || !object || !field)
+      return;
+   for (size_t i = 0; i < stored_field_count; ++i) {
+      if (stored_fields[i].jvm == jvm && stored_fields[i].object == object &&
+          stored_fields[i].field == field) {
+         stored_fields[i].bits = bits;
+         return;
+      }
+   }
+   if (stored_field_count < ARRAY_SIZE(stored_fields)) {
+      stored_fields[stored_field_count++] = (struct jvm_stored_field){
+         .jvm = jvm, .object = object, .field = field, .bits = bits
+      };
+   }
+}
+
 // N == Property method type convention (Long, Float, StaticLong, StaticFloat, etc...)
 // T == C type of return value
 // D == Default return value
@@ -883,7 +926,11 @@ gen_jnienv_method(Double, jdouble, 0)
       assert(p0 && p1 && method); \
       union { T (*fun)(JNIEnv*, jobject); void *ptr; } f; \
       f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), (jmethodID)method); \
-      return (f.ptr ? f.fun(p0, p1) : D); \
+      if (f.ptr) return f.fun(p0, p1); \
+      uint64_t bits = 0; T value = (D); \
+      if (jvm_get_field_bits(jnienv_get_jvm(p0), (jobject)p1, method, &bits)) \
+         memcpy(&value, &bits, sizeof(value)); \
+      return value; \
    } \
    static void \
    JNIEnv_Set##N##Field(JNIEnv* p0, jclass p1, jfieldID method, T p3) { \
@@ -891,6 +938,10 @@ gen_jnienv_method(Double, jdouble, 0)
       union { void (*fun)(JNIEnv*, jobject, T); void *ptr; } f; \
       if ((f.ptr = jvm_wrap_method(jnienv_get_jvm(p0), (jmethodID)method))) \
          f.fun(p0, p1, p3); \
+      else { \
+         uint64_t bits = 0; memcpy(&bits, &p3, sizeof(p3)); \
+         jvm_set_field_bits(jnienv_get_jvm(p0), (jobject)p1, method, bits); \
+      } \
    }
 
 // N == Property type name

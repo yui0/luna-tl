@@ -221,8 +221,398 @@ run_jni_game(struct jvm *jvm)
 }
 
 static int
+run_ue4_game_arm(struct jvm *jvm)
+{
+   /* UE4 GameActivity is a NativeActivity: entry is ANativeActivity_onCreate,
+    * then the engine's android_main / looper thread drives the frame loop. */
+   uint32_t va_oncreate = arm_exec_lookup_export("ANativeActivity_onCreate");
+   if (!va_oncreate)
+      errx(EXIT_FAILURE, "UE4: ANativeActivity_onCreate not found");
+
+   if (!arm_exec_host_egl_init())
+      fprintf(stderr, "[loader] host EGL re-init failed\n");
+
+   jobject activity = jvm->native.AllocObject(&jvm->env,
+         jvm->native.FindClass(&jvm->env, "com/epicgames/ue4/GameActivity"));
+   if (!activity)
+      activity = jvm->native.AllocObject(&jvm->env,
+            jvm->native.FindClass(&jvm->env, "android/app/NativeActivity"));
+   uint32_t act_va = arm_exec_native_activity_create(
+         (uint32_t)(uintptr_t)activity);
+   if (!act_va)
+      errx(EXIT_FAILURE, "UE4: failed to allocate ANativeActivity");
+
+   /* Optional JNI hooks GameActivity calls before/during native startup */
+   uint32_t va_set_global = arm_exec_lookup_native(
+         "com.epicgames.ue4.GameActivity", "nativeSetGlobalActivity");
+   uint32_t va_set_win = arm_exec_lookup_native(
+         "com.epicgames.ue4.GameActivity", "nativeSetWindowInfo");
+   uint32_t va_set_surf = arm_exec_lookup_native(
+         "com.epicgames.ue4.GameActivity", "nativeSetSurfaceViewInfo");
+   uint32_t va_resume_init = arm_exec_lookup_native(
+         "com.epicgames.ue4.GameActivity", "nativeResumeMainInit");
+   uint32_t env = arm_exec_env_va();
+   uint32_t ctx = (uint32_t)(uintptr_t)activity;
+
+   if (va_set_global) {
+      fprintf(stderr, "[loader] UE4 nativeSetGlobalActivity\n");
+      arm_exec_call(va_set_global, env, ctx, ctx, 0);
+   }
+
+   fprintf(stderr, "[loader] UE4 ANativeActivity_onCreate @0x%08x act=0x%08x\n",
+           va_oncreate, act_va);
+   arm_exec_call_unlimited(va_oncreate, act_va, 0, 0, 0);
+   arm_exec_run_pending_threads();
+   fprintf(stderr, "[loader] UE4 onCreate returned\n");
+
+   /* Do NOT call activity->callbacks->onStart/onResume/onNativeWindowCreated
+    * synchronously: the NDK glue's onNativeWindowCreated waits on a cond until
+    * android_main processes APP_CMD_INIT_WINDOW, which deadlocks if we hold the
+    * main JIT.  Instead write APP_CMD_* into the android_app command pipe and
+    * let the event thread drain them while we pump. */
+   {
+      uint32_t instance = arm_exec_read32(act_va + 28); /* ANativeActivity.instance */
+      uint32_t win = arm_exec_native_window_va();
+      fprintf(stderr, "[loader] UE4 android_app instance=0x%08x win=0x%08x\n",
+              instance, win);
+      if (instance) {
+         /* Heuristic: scan android_app for a writable pipe fd pair.
+          * Observed NDK layout (32-bit bionic): msgread @+0x48. */
+         int msgwrite = -1;
+         uint32_t pipe_off = 0;
+         for (uint32_t off = 64; off < 256; off += 4) {
+            int a = (int)arm_exec_read32(instance + off);
+            int b = (int)arm_exec_read32(instance + off + 4);
+            if (a > 2 && b > 2 && a < 1024 && b < 1024 && a != b) {
+               struct stat sa, sb;
+               if (fstat(a, &sa) == 0 && fstat(b, &sb) == 0 &&
+                   S_ISFIFO(sa.st_mode) && S_ISFIFO(sb.st_mode)) {
+                  msgwrite = b;
+                  pipe_off = off;
+                  fprintf(stderr, "[loader] UE4 cmd pipe @+0x%x read=%d write=%d\n",
+                          off, a, b);
+                  break;
+               }
+            }
+         }
+         if (win) {
+            /* Public window @36; pendingWindow sits after mutex/cond/pipe/
+             * thread/poll_sources/flags — typically msgread+0x38 (=0x80 when
+             * msgread is 0x48).  process_cmd copies pendingWindow → window. */
+            arm_exec_write32(instance + 36, win);
+            uint32_t pend = pipe_off ? pipe_off + 0x38u : 0x80u;
+            arm_exec_write32(instance + pend, win);
+            fprintf(stderr, "[loader] UE4 set window@36 pendingWindow@+0x%x = 0x%08x\n",
+                    pend, win);
+         }
+         if (msgwrite >= 0) {
+            /* APP_CMD_START=10, RESUME=11, INIT_WINDOW=1, GAINED_FOCUS=6 */
+            static const int8_t cmds[] = { 10, 11, 1, 6 };
+            for (size_t i = 0; i < sizeof cmds; ++i) {
+               int8_t c = cmds[i];
+               if (write(msgwrite, &c, 1) != 1)
+                  fprintf(stderr, "[loader] UE4 write APP_CMD %d failed\n", c);
+               else
+                  fprintf(stderr, "[loader] UE4 wrote APP_CMD %d\n", c);
+               arm_exec_run_pending_threads();
+            }
+         }
+      }
+   }
+
+   int w = arm_exec_fb_width(), h = arm_exec_fb_height();
+   if (va_set_win) {
+      fprintf(stderr, "[loader] UE4 nativeSetWindowInfo %dx%d\n", w, h);
+      arm_exec_call6(va_set_win, env, ctx, (uint32_t)w, (uint32_t)h, 0, 0);
+   }
+   if (va_set_surf) {
+      fprintf(stderr, "[loader] UE4 nativeSetSurfaceViewInfo %dx%d\n", w, h);
+      arm_exec_call6(va_set_surf, env, ctx, (uint32_t)w, (uint32_t)h, 0, 0);
+   }
+   if (va_resume_init) {
+      fprintf(stderr, "[loader] UE4 nativeResumeMainInit\n");
+      arm_exec_call(va_resume_init, env, ctx, 0, 0);
+   }
+
+   signal(SIGUSR1, svc_dump_handler);
+   signal(SIGALRM, svc_dump_handler);
+   alarm(30);
+
+   int max_frames = 0;
+   {
+      const char *mf = getenv("LUNARIA_MAX_FRAMES");
+      if (mf && *mf) max_frames = atoi(mf);
+   }
+   if (max_frames <= 0) max_frames = 300; /* default cap for first bring-up */
+
+   fprintf(stderr, "[loader] UE4 entering pump loop (max_frames=%d)\n", max_frames);
+   for (int frame = 0; frame < max_frames; ++frame) {
+      if (arm_exec_guest_abort_count() > 0) {
+         fprintf(stderr, "[loader] guest abort — stopping UE4 loop (frame %d)\n", frame);
+         break;
+      }
+      arm_exec_run_pending_threads();
+      arm_exec_egl_swap();
+      arm_exec_glfw_poll();
+      if (frame < 5 || frame % 50 == 0)
+         fprintf(stderr, "[loader] UE4 pump frame %d\n", frame);
+      if (arm_exec_glfw_should_close()) break;
+      usleep(16000);
+   }
+   return EXIT_SUCCESS;
+}
+
+/* -------------------------------------------------------------------------
+ * ARM64 UE NativeActivity pump
+ * ---------------------------------------------------------------------- */
+static int
+run_ue4_game_arm64(struct jvm *jvm)
+{
+   uint64_t va_oncreate = arm64_exec_lookup_export("ANativeActivity_onCreate");
+   if (!va_oncreate)
+      errx(EXIT_FAILURE, "UE arm64: ANativeActivity_onCreate not found");
+
+   if (!arm64_exec_host_egl_init())
+      fprintf(stderr, "[loader] arm64 host EGL init failed\n");
+
+   jobject activity = jvm->native.AllocObject(&jvm->env,
+         jvm->native.FindClass(&jvm->env, "com/epicgames/unreal/GameActivity"));
+   if (!activity)
+      activity = jvm->native.AllocObject(&jvm->env,
+            jvm->native.FindClass(&jvm->env, "android/app/NativeActivity"));
+   uint64_t act_va = arm64_exec_native_activity_create((uint64_t)(uintptr_t)activity);
+   if (!act_va)
+      errx(EXIT_FAILURE, "UE arm64: failed to allocate ANativeActivity");
+
+   fprintf(stderr, "[loader] UE arm64 ANativeActivity_onCreate @0x%llx act=0x%llx\n",
+           (unsigned long long)va_oncreate, (unsigned long long)act_va);
+   arm64_exec_call_unlimited(va_oncreate, act_va, 0, 0, 0);
+   arm64_exec_run_pending_threads();
+   fprintf(stderr, "[loader] UE arm64 onCreate returned\n");
+
+   /* Deliver APP_CMD_* via the android_app command pipe */
+   {
+      uint64_t instance_va = arm64_exec_read64(act_va + 56); /* ANativeActivity.instance */
+      uint64_t win_va      = arm64_exec_native_window_va();
+      fprintf(stderr, "[loader] UE arm64 android_app instance=0x%llx win=0x%llx\n",
+              (unsigned long long)instance_va, (unsigned long long)win_va);
+      if (instance_va) {
+         int msgwrite = -1;
+         uint32_t pipe_off = 0;
+         /* Scan android_app for a writable pipe fd pair (arm64 layout: offsets bigger) */
+         for (uint32_t off = 64; off < 512; off += 8) {
+            int a = (int)arm64_exec_read32(instance_va + off);
+            int b = (int)arm64_exec_read32(instance_va + off + 4);
+            if (a > 2 && b > 2 && a < 1024 && b < 1024 && a != b) {
+               struct stat sa, sb;
+               if (fstat(a, &sa) == 0 && fstat(b, &sb) == 0 &&
+                   S_ISFIFO(sa.st_mode) && S_ISFIFO(sb.st_mode)) {
+                  msgwrite = b; pipe_off = off;
+                  fprintf(stderr, "[loader] UE arm64 cmd pipe @+0x%x write=%d\n", off, b);
+                  break;
+               }
+            }
+         }
+         if (win_va) {
+            arm64_exec_write64(instance_va + 36, win_va);
+            uint32_t pend = pipe_off ? pipe_off + 0x38u : 0x80u;
+            arm64_exec_write64(instance_va + pend, win_va);
+            fprintf(stderr, "[loader] UE arm64 set window=0x%llx\n",
+                    (unsigned long long)win_va);
+         }
+         if (msgwrite >= 0) {
+            static const int8_t cmds[] = { 10, 11, 1, 6 };
+            for (size_t i = 0; i < sizeof cmds; ++i) {
+               int8_t c = cmds[i];
+               if (write(msgwrite, &c, 1) != 1)
+                  fprintf(stderr, "[loader] UE arm64 write APP_CMD %d failed\n", c);
+               arm64_exec_run_pending_threads();
+            }
+         }
+      }
+   }
+
+   signal(SIGUSR1, svc_dump_handler);
+   signal(SIGALRM, svc_dump_handler);
+   alarm(30);
+
+   int max_frames = 0;
+   { const char *mf = getenv("LUNARIA_MAX_FRAMES"); if (mf && *mf) max_frames = atoi(mf); }
+   if (max_frames <= 0) max_frames = 300;
+
+   fprintf(stderr, "[loader] UE arm64 entering pump loop (max_frames=%d)\n", max_frames);
+   for (int frame = 0; frame < max_frames; ++frame) {
+      arm64_exec_run_pending_threads();
+      arm64_exec_glfw_poll();
+      if (frame < 5 || frame % 50 == 0)
+         fprintf(stderr, "[loader] UE arm64 pump frame %d\n", frame);
+      if (arm64_exec_glfw_should_close()) break;
+      usleep(16000);
+   }
+   return EXIT_SUCCESS;
+}
+
+static int
+run_unity_game_arm64(struct jvm *jvm)
+{
+   static const char *cls     = "com.unity3d.player.UnityPlayer";
+   static const char *cls_svc = "com.unity3d.player.UnityPlayerForActivityOrService";
+
+#define LOOKUP2(name) \
+   (arm64_exec_lookup_native(cls, name) ?: arm64_exec_lookup_native(cls_svc, name))
+#define LOOKUP2_SIG(name, sig_buf) \
+   (arm64_exec_lookup_native_sig(cls, name, sig_buf, sizeof(sig_buf)) ?: \
+    arm64_exec_lookup_native_sig(cls_svc, name, sig_buf, sizeof(sig_buf)))
+
+   uint64_t va_init_jni = arm64_exec_lookup_native(cls, "initJni");
+   uint64_t va_done     = LOOKUP2("nativeDone");
+   uint64_t va_render   = LOOKUP2("nativeRender");
+   uint64_t va_resume   = LOOKUP2("nativeResume");
+   uint64_t va_focus    = LOOKUP2("nativeFocusChanged");
+   char recreate_sig[128] = {0};
+   uint64_t va_recreate = LOOKUP2_SIG("nativeRecreateGfxState", recreate_sig);
+   uint64_t va_inject   = arm64_exec_lookup_native(cls, "nativeInjectEvent");
+   uint64_t va_file     = arm64_exec_lookup_native(cls, "nativeFile");
+   uint64_t va_resize   = LOOKUP2("nativeResize");
+   uint64_t va_fwd_dalv = LOOKUP2("nativeForwardEventsToDalvik");
+
+#undef LOOKUP2
+#undef LOOKUP2_SIG
+
+   if (!va_init_jni || !va_render)
+      errx(EXIT_FAILURE, "not a unity jni lib (arm64)");
+
+   uint64_t env = arm64_exec_env_va();
+   const jobject context = jvm->native.AllocObject(&jvm->env,
+         jvm->native.FindClass(&jvm->env, "android/app/Activity"));
+   uint64_t ctx = (uint64_t)(uintptr_t)context;
+
+   if (va_file) {
+      const char *apk = lunaria_apk_mount_path();
+      if (apk && *apk) {
+         fprintf(stderr, "[loader] arm64 calling nativeFile (%s)...\n", apk);
+         jobject str = jvm->native.NewStringUTF(&jvm->env, apk);
+         arm64_exec_call(va_file, env, ctx, (uint64_t)(uintptr_t)str, 0);
+         arm64_exec_run_pending_threads();
+      }
+   }
+
+   fprintf(stderr, "[loader] arm64 calling initJni (va=0x%llx)...\n",
+           (unsigned long long)va_init_jni);
+   arm64_exec_call(va_init_jni, env, ctx, ctx, 0);
+   arm64_exec_run_pending_threads();
+   fprintf(stderr, "[loader] arm64 initJni done\n");
+
+   if (!arm64_exec_host_egl_init())
+      fprintf(stderr, "[loader] arm64 host EGL re-init failed\n");
+
+   if (va_recreate) {
+      const jobject fake_surf = jvm->native.AllocObject(&jvm->env,
+            jvm->native.FindClass(&jvm->env, "android/view/Surface"));
+      int unity4_sig = (recreate_sig[0] == '(' && recreate_sig[1] == 'L');
+      if (unity4_sig) {
+         fprintf(stderr, "[loader] arm64 nativeRecreateGfxState (Unity4)...\n");
+         arm64_exec_call(va_recreate, env, ctx, (uint64_t)(uintptr_t)fake_surf, 0);
+      } else {
+         fprintf(stderr, "[loader] arm64 nativeRecreateGfxState (displayId=0)...\n");
+         arm64_exec_call(va_recreate, env, ctx, 0, (uint64_t)(uintptr_t)fake_surf);
+      }
+      arm64_exec_run_pending_threads();
+   }
+
+   if (va_resize) {
+      int w = arm64_exec_fb_width(), h = arm64_exec_fb_height();
+      fprintf(stderr, "[loader] arm64 nativeResize(%d,%d)...\n", w, h);
+      arm64_exec_call6(va_resize, env, ctx, (uint64_t)w, (uint64_t)h,
+                       (uint64_t)w, (uint64_t)h);
+   }
+   if (va_focus)
+      arm64_exec_call(va_focus, env, ctx, 1, 0);
+   if (va_fwd_dalv)
+      arm64_exec_call(va_fwd_dalv, env, ctx, 0, 0);
+   if (va_resume)
+      arm64_exec_call(va_resume, env, ctx, 0, 0);
+   arm64_exec_run_pending_threads();
+
+   fprintf(stderr, "[loader] arm64 entering Unity render loop\n");
+   signal(SIGUSR1, svc_dump_handler);
+   signal(SIGALRM, svc_dump_handler);
+   alarm(30);
+
+   int frame_count = 0, fail_streak = 0, last_ok = -1, resized_after_init = 0;
+   int max_frames = 0;
+   {
+      const char *mf = getenv("LUNARIA_MAX_FRAMES");
+      if (mf && *mf) max_frames = atoi(mf);
+   }
+   if (max_frames <= 0) max_frames = 300;
+
+   for (;;) {
+      if (max_frames > 0 && frame_count >= max_frames) {
+         fprintf(stderr, "[loader] LUNARIA_MAX_FRAMES=%d reached\n", max_frames);
+         break;
+      }
+      if (va_inject && arm_exec_touch_next()) {
+         static jobject motion_ev;
+         if (!motion_ev)
+            motion_ev = jvm->native.AllocObject(&jvm->env,
+                  jvm->native.FindClass(&jvm->env, "android/view/MotionEvent"));
+         if (va_fwd_dalv)
+            arm64_exec_call(va_fwd_dalv, env, ctx, 0, 0);
+         arm64_exec_call(va_inject, env, ctx, (uint64_t)(uintptr_t)motion_ev, 0);
+      }
+
+      arm_exec_drain_gl_thread_jobs();
+      int ok = (int)arm64_exec_call_unlimited(va_render, env, ctx, 0, 0);
+
+      if (!resized_after_init && frame_count >= 1 && va_resize) {
+         int w = arm64_exec_fb_width(), h = arm64_exec_fb_height();
+         arm64_exec_call6(va_resize, env, ctx, (uint64_t)w, (uint64_t)h,
+                          (uint64_t)w, (uint64_t)h);
+         resized_after_init = 1;
+      }
+
+      arm64_exec_run_pending_threads();
+      arm64_exec_egl_swap();
+      arm64_exec_glfw_poll();
+      ++frame_count;
+      if (ok != last_ok || frame_count <= 5 || (frame_count % 50 == 0)) {
+         fprintf(stderr, "[loader] arm64 nativeRender → %d (frame %d)\n",
+                 ok, frame_count);
+         last_ok = ok;
+      }
+      fail_streak = ok ? 0 : fail_streak + 1;
+      if (fail_streak > 3)
+         usleep(16000);
+      if (arm64_exec_glfw_should_close()) break;
+   }
+
+   if (va_done)
+      arm64_exec_call(va_done, env, ctx, 0, 0);
+   return EXIT_SUCCESS;
+}
+
+static int
+run_jni_game_arm64(struct jvm *jvm)
+{
+   /* UE NativeActivity path */
+   if (arm64_exec_lookup_export("ANativeActivity_onCreate"))
+      return run_ue4_game_arm64(jvm);
+   /* UnityPlayer.initJni path (IL2CPP / Mono) */
+   if (arm64_exec_lookup_native("com.unity3d.player.UnityPlayer", "initJni"))
+      return run_unity_game_arm64(jvm);
+   fprintf(stderr, "[loader] arm64: no known entry point\n");
+   return EXIT_FAILURE;
+}
+
+static int
 run_jni_game_arm(struct jvm *jvm)
 {
+   /* UE4 NativeActivity path (no UnityPlayer.initJni) */
+   if (arm_exec_lookup_export("ANativeActivity_onCreate") &&
+       !arm_exec_lookup_native("com.unity3d.player.UnityPlayer", "initJni"))
+      return run_ue4_game_arm(jvm);
+
    /* Unity <= 2019: all methods on UnityPlayer.
     * Unity 2020+:  render/lifecycle moved to UnityPlayerForActivityOrService. */
    static const char *cls      = "com.unity3d.player.UnityPlayer";
@@ -245,6 +635,8 @@ run_jni_game_arm(struct jvm *jvm)
    uint32_t va_inject   = arm_exec_lookup_native(cls, "nativeInjectEvent");
    uint32_t va_file     = arm_exec_lookup_native(cls, "nativeFile");
    uint32_t va_resize   = LOOKUP2("nativeResize");
+   uint32_t va_fwd_dalv = LOOKUP2("nativeForwardEventsToDalvik");
+   uint32_t fwd_flag_va = 0; /* Unity 5.3 ForwardEventsToDalvik BSS byte */
 
 #undef LOOKUP2
 #undef LOOKUP2_SIG
@@ -330,11 +722,41 @@ run_jni_game_arm(struct jvm *jvm)
     * arm_exec_call (レジスタ 4 本のみ) だと 0 を読み scale=inf になり、
     * 以後の全タッチ座標が inf に化ける (GUI.Button が反応しない真因)。 */
    fprintf(stderr, "[loader] calling nativeResize...\n");
-   if (va_resize)
-      arm_exec_call6(va_resize, env, ctx, 1280, 720, 1280, 720);
+   if (va_resize) {
+      int w = arm_exec_fb_width(), h = arm_exec_fb_height();
+      arm_exec_call6(va_resize, env, ctx, (uint32_t)w, (uint32_t)h,
+                     (uint32_t)w, (uint32_t)h);
+   }
    fprintf(stderr, "[loader] calling nativeFocusChanged...\n");
    if (va_focus)
       arm_exec_call(va_focus, env, ctx, 1, 0);
+   /* APK meta-data unityplayer.ForwardNativeEventsToDalvik=true makes
+    * Unity 5.x nativeInjectEvent skip the native queue (return 0) when the
+    * forward-to-Dalvik flag byte is set.  We have no Dalvik touch dispatch —
+    * inject is our only path — so force the flag clear.  The JNI call itself
+    * can no-op if Unity's Scoped* TLS (+0x104) is busy; poke the BSS byte
+    * when the Unity 5.3 strb pattern matches. */
+   if (va_fwd_dalv) {
+      fprintf(stderr, "[loader] nativeForwardEventsToDalvik(false)\n");
+      arm_exec_call(va_fwd_dalv, env, ctx, 0, 0);
+      /* Unity 5.3.3: strb r7,[r0,#0xc] at fwd+0x118; literals at +0x154/+0x158 */
+      if (arm_exec_read32(va_fwd_dalv + 0x118u) == 0xe5c0700cu) {
+         uint32_t lit0 = arm_exec_read32(va_fwd_dalv + 0x154u);
+         uint32_t lit1 = arm_exec_read32(va_fwd_dalv + 0x158u);
+         fwd_flag_va = (va_fwd_dalv + 0x118u) + lit0 + lit1 + 0xcu;
+         uint32_t word = arm_exec_read32(fwd_flag_va & ~3u);
+         unsigned sh = (fwd_flag_va & 3u) * 8u;
+         unsigned cur = (word >> sh) & 0xffu;
+         if (cur) {
+            arm_exec_write32(fwd_flag_va & ~3u, word & ~(0xffu << sh));
+            fprintf(stderr, "[loader] cleared ForwardEventsToDalvik flag "
+                    "@ 0x%08x (was %u)\n", fwd_flag_va, cur);
+         } else {
+            fprintf(stderr, "[loader] ForwardEventsToDalvik flag @ 0x%08x "
+                    "already 0\n", fwd_flag_va);
+         }
+      }
+   }
    fprintf(stderr, "[loader] calling nativeResume...\n");
    if (va_resume)
       arm_exec_call(va_resume, env, ctx, 0, 0);
@@ -365,25 +787,46 @@ run_jni_game_arm(struct jvm *jvm)
                  max_frames);
          break;
       }
-      /* LUNARIA_TOUCH_TEST=x,y: フレーム 300 で DOWN、310 で UP を自動注入
-       * (X11 フォーカスに依存しないタップ検証用) */
+      /* LUNARIA_TOUCH_TEST=x,y: auto DOWN/UP (default frames 60/70).
+       * LUNARIA_TOUCH_FRAME=N  : DOWN frame (UP = N + hold).
+       * LUNARIA_TOUCH_HOLD=N   : hold duration in frames (default 10).
+       *                          Each frame during the hold injects ACTION_MOVE
+       *                          so Unity sees a continuous touch. */
       {
          static float tt_x = -1, tt_y = -1; static int tt_parsed = 0;
+         static int tt_frame = 60, tt_hold = 10;
          if (!tt_parsed) {
             tt_parsed = 1;
             const char *tt = getenv("LUNARIA_TOUCH_TEST");
             if (tt) sscanf(tt, "%f,%f", &tt_x, &tt_y);
+            const char *tf = getenv("LUNARIA_TOUCH_FRAME");
+            if (tf) { int v = atoi(tf); if (v > 0) tt_frame = v; }
+            const char *th = getenv("LUNARIA_TOUCH_HOLD");
+            if (th) { int v = atoi(th); if (v > 0) tt_hold = v; }
          }
          if (tt_x >= 0) {
             /* フォーカス再送: 実機では surfaceChanged 後に focus が届く。
              * ループ前の nativeFocusChanged はエンジン初期化で上書きされる
              * 疑いがあるため、タップ前に再送して入力ゲートを開く */
-            if (frame_count == 250 && va_focus) {
+            if (frame_count == tt_frame - 10 && tt_frame > 10 && va_focus) {
                arm_exec_call(va_focus, env, ctx, 1, 0);
-               fprintf(stderr, "[loader] nativeFocusChanged(1) re-sent (frame 250)\n");
+               fprintf(stderr, "[loader] nativeFocusChanged(1) re-sent (frame %d)\n",
+                       frame_count);
             }
-            if (frame_count == 300) arm_exec_touch_push(0, tt_x, tt_y);
-            if (frame_count == 310) arm_exec_touch_push(1, tt_x, tt_y);
+            if (frame_count == tt_frame) {
+               arm_exec_touch_push(0, tt_x, tt_y);  /* ACTION_DOWN */
+               fprintf(stderr, "[loader] TOUCH_TEST DOWN (%.0f,%.0f) frame %d\n",
+                       tt_x, tt_y, frame_count);
+            }
+            /* ACTION_MOVE: send every frame while held so Unity keeps the touch active */
+            if (frame_count > tt_frame && frame_count < tt_frame + tt_hold) {
+               arm_exec_touch_push(2, tt_x, tt_y);
+            }
+            if (frame_count == tt_frame + tt_hold) {
+               arm_exec_touch_push(1, tt_x, tt_y);  /* ACTION_UP */
+               fprintf(stderr, "[loader] TOUCH_TEST UP (%.0f,%.0f) frame %d (hold=%d)\n",
+                       tt_x, tt_y, frame_count, tt_hold);
+            }
          }
       }
       /* GLFW マウス → MotionEvent 注入 (UnityPlayer.onTouchEvent 相当)。
@@ -392,6 +835,15 @@ run_jni_game_arm(struct jvm *jvm)
        * タップは DOWN と UP が別フレームに届く。同一フレームに両方入れると
        * Unity の Input 集計でタップと認識されないことがある。 */
       if (va_inject && arm_exec_touch_next()) {
+         /* Re-clear in case Java/meta-data path set the flag during startup. */
+         if (fwd_flag_va) {
+            uint32_t word = arm_exec_read32(fwd_flag_va & ~3u);
+            unsigned sh = (fwd_flag_va & 3u) * 8u;
+            if ((word >> sh) & 0xffu)
+               arm_exec_write32(fwd_flag_va & ~3u, word & ~(0xffu << sh));
+         }
+         if (va_fwd_dalv)
+            arm_exec_call(va_fwd_dalv, env, ctx, 0, 0);
          static jobject motion_ev;
          if (!motion_ev)
             motion_ev = jvm->native.AllocObject(&jvm->env,
@@ -438,9 +890,12 @@ run_jni_game_arm(struct jvm *jvm)
        * 届く。ループ前の nativeResize はエンジン未初期化で無視されるため
        * (画面が 128x128 の既定値のままになる)、初回フレーム完了後に再送する。 */
       if (!resized_after_init && frame_count >= 1 && va_resize) {
-         arm_exec_call6(va_resize, env, ctx, 1280, 720, 1280, 720);
+         int w = arm_exec_fb_width(), h = arm_exec_fb_height();
+         arm_exec_call6(va_resize, env, ctx, (uint32_t)w, (uint32_t)h,
+                        (uint32_t)w, (uint32_t)h);
          resized_after_init = 1;
-         fprintf(stderr, "[loader] nativeResize(1280,720,1280,720) re-sent after first frame\n");
+         fprintf(stderr, "[loader] nativeResize(%d,%d,%d,%d) re-sent after first frame\n",
+                 w, h, w, h);
       }
       /* LUNARIA_TOUCH_DIAG=cntSyncVA,cntPhaseVA,getTouchVA:
        * 毎フレーム libunity のタッチカウント関数をゲスト呼び出しして
@@ -530,6 +985,68 @@ main(int argc, const char *argv[])
 
    printf("loading module: %s\n", argv[1]);
 
+   /* ARM64 ELF: use A64 dynarmic emulation path */
+   if (arm64_elf_is_arm64(argv[1])) {
+      printf("detected ARM64 ELF — using A64 dynarmic emulation\n");
+      setenv("GC_DONT_GC", "1", 0);
+      setenv("GC_MAXIMUM_HEAP_SIZE", "268435456", 0);
+      setenv("GC_INITIAL_HEAP_SIZE", "67108864",  0);
+      static struct jvm jvm;
+      jvm_init(&jvm);
+
+      if (arm64_exec_context_init(&jvm) < 0)
+         errx(EXIT_FAILURE, "arm64_exec_context_init failed");
+
+      /* Pre-load companion libraries from the same directory */
+      {
+         char dir[4096], libpath[4096];
+         struct stat stbuf;
+         snprintf(dir, sizeof(dir), "%s", argv[1]);
+         char *slash = strrchr(dir, '/');
+         if (slash) *(slash + 1) = '\0'; else dir[0] = '\0';
+
+         /* libc++_shared.so first */
+         snprintf(libpath, sizeof(libpath), "%s%s", dir, "libc++_shared.so");
+         if (stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+            printf("preloading arm64 libc++_shared: %s\n", libpath);
+            arm64_exec_load_library(libpath, 0);
+         }
+         /* Unity IL2CPP + Frame Pacing (must precede libunity PLT bind) */
+         static const char *unity_deps[] = {
+            "libil2cpp.so", "libswappywrapper.so", NULL
+         };
+         for (int k = 0; unity_deps[k]; k++) {
+            snprintf(libpath, sizeof(libpath), "%s%s", dir, unity_deps[k]);
+            if (stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+               printf("preloading arm64 dep: %s\n", libpath);
+               arm64_exec_load_library(libpath, 0);
+            }
+         }
+         /* libpsoservice.so and other UE companion libs */
+         static const char *ue_deps[] = {
+            "libpsoservice.so", "libhwcpipe.so", NULL
+         };
+         for (int k = 0; ue_deps[k]; k++) {
+            snprintf(libpath, sizeof(libpath), "%s%s", dir, ue_deps[k]);
+            if (stat(libpath, &stbuf) == 0 && arm64_elf_is_arm64(libpath)) {
+               printf("preloading arm64 dep: %s\n", libpath);
+               arm64_exec_load_library(libpath, 0);
+            }
+         }
+      }
+
+      if (!arm64_exec_host_egl_init())
+         fprintf(stderr, "[loader] early arm64 host EGL init failed\n");
+
+      int jni_ver = arm64_exec_jni_onload(argv[1], &jvm);
+      if (jni_ver < 0)
+         errx(EXIT_FAILURE, "arm64_exec_jni_onload failed");
+      int ret = run_jni_game_arm64(&jvm);
+      jvm_release(&jvm);
+      printf("exiting\n");
+      return ret;
+   }
+
    /* ARM 32-bit ELF: use dynarmic emulation path */
    if (arm_elf_is_arm32(argv[1])) {
       printf("detected ARM32 ELF — using dynarmic emulation\n");
@@ -604,6 +1121,19 @@ main(int argc, const char *argv[])
          if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
             printf("preloading swappywrapper: %s\n", libpath);
             arm_exec_load_library(libpath, 0);
+         }
+
+         /* UE4 companion libs (DT_NEEDED of libUE4.so / optional plugins) */
+         static const char *ue4_deps[] = {
+            "libplaycore.so", "libhwcpipe.so", "libtry-alloc-lib.so",
+            "libOVRPlugin.so", "libvrapi.so", NULL
+         };
+         for (int k = 0; ue4_deps[k]; k++) {
+            snprintf(libpath, sizeof(libpath), "%s%s", dir, ue4_deps[k]);
+            if (stat(libpath, &stbuf) == 0 && arm_elf_is_arm32(libpath)) {
+               printf("preloading UE4 dep: %s\n", libpath);
+               arm_exec_load_library(libpath, 0);
+            }
          }
       }
 

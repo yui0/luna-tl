@@ -14,8 +14,12 @@ err() { msg "$@"; exit 1; }
 [ -z "$1" ] && err 'usage: <apk>'
 pkgfile="$(realpath "$1")"
 
-# lunaria is an ARM32 JIT emulator; always use armeabi-v7a from the APK
-arch="armeabi-v7a"
+# Prefer arm64-v8a (A64 JIT); fall back to armeabi-v7a (A32 JIT)
+if unzip -l "$1" 2>/dev/null | grep -q 'lib/arm64-v8a/'; then
+    arch="arm64-v8a"
+else
+    arch="armeabi-v7a"
+fi
 
 pkgname="$(python3 - "$1" <<'PYEOF'
 import sys, zipfile, struct, re
@@ -148,13 +152,21 @@ for dirpath, _, files in os.walk(root):
         print(f"[lunaria-apk] joined {len(parts)} splits → {os.path.relpath(out, root)}",
               file=sys.stderr)
 print(f"[lunaria-apk] joined {joined} split asset(s)", file=sys.stderr)
+open(os.path.join(root, ".lunaria-joined-count"), "w").write(str(joined))
 PYEOF
 
-# Repack extract tree as STORE APK so Unity's ZIP ArchiveFileSystem also sees
-# the joined assets (original APK still has DEFLATE'd .splitN entries only).
-repacked="$tmpdir/lunaria-joined.apk"
-( cd "$tmpdir" && zip -0 -q -r "$repacked" . -x "lunaria-joined.apk" ) || err "repack apk failed"
-export ANDROID_APK_FILE="$repacked"
+# Repack only when Unity split assets were joined.  UE4 / plain APKs keep the
+# original file (repacking a 200MB+ libUE4.so extract is slow and unnecessary).
+joined_n=0
+[ -f "$tmpdir/.lunaria-joined-count" ] && joined_n="$(cat "$tmpdir/.lunaria-joined-count")"
+rm -f "$tmpdir/.lunaria-joined-count"
+if [ "${joined_n:-0}" -gt 0 ] || [ -d "$tmpdir/assets/bin/Data" ]; then
+    repacked="$tmpdir/lunaria-joined.apk"
+    ( cd "$tmpdir" && zip -0 -q -r "$repacked" . -x "lunaria-joined.apk" ) || err "repack apk failed"
+    export ANDROID_APK_FILE="$repacked"
+else
+    export ANDROID_APK_FILE="$pkgfile"
+fi
 
 if [ -d "$managed_dir" ]; then
     # Mono's mono_assembly_load_corlib() searches for corlib at
@@ -182,6 +194,21 @@ fi
 
 export ANDROID_PACKAGE_CODE_PATH="$tmpdir"
 export ANDROID_PACKAGE_NAME="$pkgname"
+
+# Portrait / landscape defaults for known titles (override with LUNARIA_WIDTH/HEIGHT)
+case "$pkgname" in
+    org.gekoi.timelocker)
+        : "${LUNARIA_WIDTH:=720}"
+        : "${LUNARIA_HEIGHT:=1280}"
+        export LUNARIA_WIDTH LUNARIA_HEIGHT
+        ;;
+    com.YourCompany.FPSMobile)
+        : "${LUNARIA_WIDTH:=1280}"
+        : "${LUNARIA_HEIGHT:=720}"
+        export LUNARIA_WIDTH LUNARIA_HEIGHT
+        ;;
+esac
+
 # Unity の nativeFile へ渡す実 APK ファイル。上で split 結合済みの
 # lunaria-joined.apk を優先（元 APK は ANDROID 用参照として残さない）。
 # 展開ディレクトリは AssetManager ブリッジ/Mono 用に維持。
@@ -208,7 +235,6 @@ if [ -d "$managed_dir" ]; then
     export MONO_CONFIG="$mono_cfg/mono/config"
 fi
 
-# XXX: We only work with unity stuff for now
 export LD_LIBRARY_PATH="$PWD:$PWD/runtime${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 # Standard APK: lib/$arch/  or  App Bundle split APK: base/lib/$arch/
@@ -216,4 +242,17 @@ libdir="$tmpdir/lib/$arch"
 [ -d "$libdir" ] || libdir="$tmpdir/base/lib/$arch"
 [ -d "$libdir" ] || err "no lib/$arch found in APK (tried lib/ and base/lib/)"
 
-./lunaria "$libdir/libunity.so"
+# Main native library: Unity → libunity.so, UE4 → libUE4.so/libUnreal.so, else first lib*.so
+main_so=""
+for cand in libunity.so libUE4.so libUnreal.so libmain.so; do
+    if [ -f "$libdir/$cand" ]; then
+        main_so="$libdir/$cand"
+        break
+    fi
+done
+if [ -z "$main_so" ]; then
+    main_so="$(find "$libdir" -maxdepth 1 -name 'lib*.so' ! -name 'libc++_shared.so' | head -1)"
+fi
+[ -n "$main_so" ] && [ -f "$main_so" ] || err "no main native library in $libdir"
+msg "main lib: $main_so"
+./lunaria "$main_so"

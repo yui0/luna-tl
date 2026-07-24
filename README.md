@@ -40,8 +40,10 @@ make test
 
 # Run with APK (recommended)
 bash lunaria-apk.sh UnitySampleGame.apk
-bash lunaria-apk.sh test/dfu-mono-32bit.apk
 bash lunaria-apk.sh test/btw-android.apk
+bash lunaria-apk.sh test/dfu-mono-32bit.apk
+bash lunaria-apk.sh time-locker-1-7-2.apk
+bash lunaria-apk.sh FPSMobile-armv7.apk
 
 # Direct library run
 # LD_LIBRARY_PATH=.:runtime ANDROID_PACKAGE_CODE_PATH=$PWD/test/dfu-mono-32bit.apk ./lunaria test/libunity.so
@@ -54,14 +56,17 @@ Xvfb :99 & DISPLAY=:99 ./lunaria ...
 
 ### ⚙️ Environment Variables
 
-| Variable                    | Default     | Description |
+| Variable                   | Default     | Description |
 |----------------------------|-------------|-----------|
 | `LUNARIA_CALL_TICKS`       | 2G          | Tick limit per JNI call |
 | `LUNARIA_ONLOAD_TICKS`     | 5G          | Tick limit for `JNI_OnLoad` |
 | `LUNARIA_THREAD_TICKS`     | 200M        | Tick slice per guest thread |
 | `LUNARIA_TRACE_SVC`        | off         | Log SVC calls (first 1000) |
 | `LUNARIA_TRACE_BLOCKS`     | 0           | Log JIT block execution |
-| `LUNARIA_DUMP_LAST_SVC`    | off         | Dump last 64 SVCs on exit |
+| `LUNARIA_DUMP_FRAME`       | off         | Dump PPM at listed swap indices (`0,5,10`) |
+| `LUNARIA_DUMP_DIR`         | `/tmp`      | Screenshot output directory |
+| `LUNARIA_SCREENSHOT_EVERY` | off         | Dump every N swaps |
+| `LUNARIA_WIDTH`/`HEIGHT`   | 1280×720    | Window / EGL size (Time Locker defaults to 720×1280) |
 | `LUNARIA_TRACE_FUTEX`      | off         | Log futex wait/wake |
 | `LUNARIA_TRACE_JITINIT`    | off         | Trace `mono_jit_init_version` |
 | `GC_DONT_GC`               | 1           | Disable Boehm GC (set by loader) |

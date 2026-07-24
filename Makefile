@@ -25,7 +25,7 @@ CPPFLAGS += -Isrc -DANDROID_X86_LINKER # -DVERBOSE_FUNCTIONS
 bins = lunaria
 libs = runtime/libpthread.so runtime/libdl.so runtime/libc.so runtime/libandroid.so \
        runtime/liblog.so runtime/libEGL.so runtime/libOpenSLES.so runtime/libjvm.so \
-       runtime/libm.so runtime/libz.so runtime/libmediandk.so
+       runtime/libm.so runtime/libz.so runtime/libmediandk.so runtime/libGLESv3.so
 
 all: $(bins)
 
@@ -124,6 +124,10 @@ runtime/libmediandk.so:
 	mkdir -p runtime
 	$(STUB_SO) -DLUNARIA_STUB_MEDIANDK -o $@
 
+runtime/libGLESv3.so:
+	mkdir -p runtime
+	$(STUB_SO) -DLUNARIA_STUB_GLESV3 -D_GNU_SOURCE -o $@ -lGLESv2
+
 # trick linker to link against unversioned libs
 libdl.so: runtime/libdl.so
 	ln -s runtime/libdl.so $@
@@ -146,7 +150,7 @@ lunaria: loader.o arm_exec.o trace.o libdl.so libpthread.so \
        runtime/libpthread.so runtime/libc.so \
        runtime/libandroid.so runtime/liblog.so \
        runtime/libEGL.so runtime/libOpenSLES.so \
-       runtime/libjvm.so
+       runtime/libjvm.so runtime/libm.so runtime/libz.so
 	$(CXX) -std=c++20 -O2 -g \
 	    -L. -Wl,-Y,runtime,-rpath,$(PREFIX)$(LIBDIR)$(RUNTIMEDIR) $(LDFLAGS) \
 	    loader.o arm_exec.o trace.o \
@@ -214,7 +218,7 @@ $(DYNARMIC_LIB):
 	    -DDYNARMIC_WARNINGS_AS_ERRORS=OFF \
 	    -DDYNARMIC_TESTS=OFF \
 	    -DCMAKE_BUILD_TYPE=Release \
-	    -DDYNARMIC_FRONTENDS="A32" \
+	    -DDYNARMIC_FRONTENDS="A32;A64" \
 	    -DCMAKE_POLICY_VERSION_MINIMUM=3.5
 	cmake --build $(DYNARMIC_BUILD) -j$(shell nproc)
 

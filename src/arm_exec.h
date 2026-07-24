@@ -78,6 +78,14 @@ uint32_t arm_exec_env_va(void);
 /* Poll GLFW events (call from the render loop). */
 void arm_exec_glfw_poll(void);
 
+/* Dump current framebuffer to PPM.  path may be NULL → /tmp/lunaria_NNNN.ppm.
+ * Returns 1 on success.  Also: F12 in the window, or `touch /tmp/lunaria-shot`. */
+int arm_exec_screenshot(const char *path);
+
+/* Framebuffer / window size (LUNARIA_WIDTH / LUNARIA_HEIGHT, default 1280×720). */
+int arm_exec_fb_width(void);
+int arm_exec_fb_height(void);
+
 /* Touch input bridge (GLFW mouse → Android MotionEvent).
  * arm_exec_touch_next() pops the next queued event and makes it "current";
  * returns 0 when the queue is empty.  The accessors below return the current
@@ -152,6 +160,110 @@ const char *arm_exec_get_main_lib_dir(void);
  * Call after a run that may have corrupted ARM state (stack overflow / exception).
  * Prevents stale register values from being restored into the next JNI call. */
 void arm_exec_reset_saved_regs(void);
+
+/* Allocate `size` bytes in the guest heap.  Returns guest VA, or 0 on OOM. */
+uint32_t arm_exec_malloc(uint32_t size);
+
+/* Copy a host C string into guest memory (NUL-terminated).  Returns VA or 0. */
+uint32_t arm_exec_strdup(const char *s);
+
+/* Build a guest ANativeActivity (+ callbacks) for UE4 NativeActivity entry.
+ * Returns the activity VA, or 0 on failure.  `clazz` is a jobject handle. */
+uint32_t arm_exec_native_activity_create(uint32_t clazz_handle);
+
+/* Ensure a fake ANativeWindow exists; return its guest VA (for onNativeWindowCreated). */
+uint32_t arm_exec_native_window_va(void);
+
+/* -------------------------------------------------------------------------
+ * ARM64 (AArch64) execution engine — parallel to the ARM32 engine above.
+ * All arm64_exec_* functions mirror their arm_exec_* counterparts but
+ * operate on the A64 JIT (Dynarmic::A64::Jit) and load Elf64 binaries.
+ * ---------------------------------------------------------------------- */
+
+/* Detect whether the ELF at `path` is an AArch64 (arm64-v8a) shared object. */
+int arm64_elf_is_arm64(const char *path);
+
+/* Initialize the ARM64 execution context (JNI tables, stack, heap).
+ * Must be called before arm64_exec_load_library or arm64_exec_jni_onload. */
+int arm64_exec_context_init(struct jvm *jvm);
+
+/* Load an additional ARM64 ELF shared library into the current A64 context.
+ * `base_addr` == 0 → auto-place after previously loaded libraries. */
+int arm64_exec_load_library(const char *path, uint64_t base_addr);
+
+/* Load an ARM64 ELF and call JNI_OnLoad. Returns JNI version or -1. */
+int arm64_exec_jni_onload(const char *path, struct jvm *jvm);
+
+/* Call an ARM64 function with up to 4 register arguments (x0-x3). */
+int64_t arm64_exec_call(uint64_t fn_va, uint64_t x0, uint64_t x1,
+                        uint64_t x2, uint64_t x3);
+
+/* A64: nativeResize etc. — first 8 args in x0–x7 (no stack needed for 6). */
+int64_t arm64_exec_call6(uint64_t fn_va, uint64_t x0, uint64_t x1,
+                         uint64_t x2, uint64_t x3, uint64_t x4, uint64_t x5);
+
+/* Like arm64_exec_call but with no tick limit. */
+int64_t arm64_exec_call_unlimited(uint64_t fn_va, uint64_t x0, uint64_t x1,
+                                  uint64_t x2, uint64_t x3);
+
+/* Look up an exported symbol VA by name. Returns 0 if not found. */
+uint64_t arm64_exec_lookup_export(const char *sym);
+
+/* Look up a RegisterNatives-registered native method VA. */
+uint64_t arm64_exec_lookup_native(const char *klass, const char *method);
+
+/* Like arm64_exec_lookup_native but also fills sig_out. */
+uint64_t arm64_exec_lookup_native_sig(const char *klass, const char *method,
+                                      char *sig_out, int sig_max);
+
+/* Return the A64 JNIEnv* guest VA (ENV_SLOT64_BASE). */
+uint64_t arm64_exec_env_va(void);
+
+/* Build and return an ANativeActivity guest struct for UE NativeActivity. */
+uint64_t arm64_exec_native_activity_create(uint64_t clazz_handle);
+
+/* Ensure a fake ANativeWindow exists; return its guest VA. */
+uint64_t arm64_exec_native_window_va(void);
+
+/* Read / write guest memory (64-bit addresses). */
+uint32_t arm64_exec_read32(uint64_t va);
+uint64_t arm64_exec_read64(uint64_t va);
+void     arm64_exec_write32(uint64_t va, uint32_t val);
+void     arm64_exec_write64(uint64_t va, uint64_t val);
+
+/* Allocate `size` bytes in the A64 guest heap. Returns guest VA or 0. */
+uint64_t arm64_exec_malloc(uint64_t size);
+
+/* Copy a host C string into A64 guest memory. Returns VA or 0. */
+uint64_t arm64_exec_strdup(const char *s);
+
+/* Initialize host EGL+GLES2 context (shared with A32 path). */
+int arm64_exec_host_egl_init(void);
+
+/* Poll GLFW events. */
+void arm64_exec_glfw_poll(void);
+
+/* Present host EGL surface. */
+void arm64_exec_egl_swap(void);
+
+/* Dump framebuffer to PPM. */
+int arm64_exec_screenshot(const char *path);
+
+/* Window dimensions. */
+int arm64_exec_fb_width(void);
+int arm64_exec_fb_height(void);
+
+/* Touch input. */
+void arm64_exec_touch_push(int action, float x, float y);
+
+/* Run queued guest threads (cooperative scheduler). */
+void arm64_exec_run_pending_threads(void);
+
+/* GLFW window close requested? */
+int arm64_exec_glfw_should_close(void);
+
+/* Dump recent SVC ring for diagnostics. */
+void arm64_exec_svc_ring_dump(void);
 
 #ifdef __cplusplus
 }
